@@ -23,6 +23,9 @@ def send_tweet(message):
 
 def main():
     # --- FETCH FPL DATA ---
+
+    send_tweet("Hello! My automated FPL bot is officially alive and working! 🤖⚽ #FPL")
+    
     fpl_static = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/").json()
     fpl_fixtures = requests.get("https://fantasy.premierleague.com/api/fixtures/").json()
     
