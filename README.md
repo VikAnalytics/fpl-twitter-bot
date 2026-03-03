@@ -1,10 +1,7 @@
 # 🤖 Serverless FPL Twitter Agent
 
-An automated, serverless Python bot that tracks the official Fantasy Premier League (FPL) API and posts critical updates directly to X (Twitter). 
+An event-driven FPL data pipeline that tracks API changes, manages state to provide real-time alerts and posts critical updates directly to X (Twitter). 
 
-
-
-This project runs 24/7 in the cloud without a dedicated server, utilizing **GitHub Actions** as a cron scheduler to extract data, evaluate state changes, and push real-time alerts for FPL managers.
 
 ## ✨ Key Features
 
@@ -13,19 +10,24 @@ This project runs 24/7 in the cloud without a dedicated server, utilizing **GitH
 * **🔥 Blank & Double Gameweek Detection:** Dynamically parses the weekly fixture lists to identify teams playing zero or multiple times in a single gameweek.
 * **🌟 Weekly Wrap-Up:** Automatically triggers after a gameweek concludes to extract, sort, and publish the top 3 highest-scoring players of the week.
 
-## 🛠️ Architecture & Tech Stack
+## 🏗️ Architecture: Decoupled & Event-Driven
+Unlike standard cron-based scripts which are prone to execution jitter, this project utilizes a **decoupled orchestration pattern**. 
 
-* **Language:** Python 3.10
-* **Data Source:** Official FPL REST API (`bootstrap-static` and `fixtures` endpoints)
-* **Integration:** X/Twitter API v2 (via `tweepy` library)
-* **Automation:** GitHub Actions (Scheduled CRON jobs running hourly)
-* **State Management:** JSON (`fpl_state.json`) written back to the repository by the GitHub bot to maintain continuity between ephemeral serverless runs.
+* **Orchestration Layer:** An external, precision-timed scheduler (`cron-job.org`) handles the clock, ensuring sub-second execution timing.
+* **Compute Layer:** GitHub Actions acts as a serverless execution environment, triggered only via the GitHub REST API (`workflow_dispatch`).
+* **Why this matters:** This architecture separates the "clock" from the "compute," ensuring reliable execution and preventing the "thundering herd" latency issues common in native CI/CD schedulers.
 
-## ⚙️ How It Works (The ETL Pipeline)
+## ⚙️ How It Works (The Pipeline)
 
-1. **Extract:** Every hour, GitHub Actions spins up a container and pulls the latest JSON payloads from the FPL API.
-2. **Transform:** The Python script parses the data, compares current injury statuses and gameweek IDs against the stored `fpl_state.json` memory file, and formats the output strings.
-3. **Load:** If new conditions are met (e.g., a new injury, or the deadline is <12 hours away), the bot authenticates securely via GitHub Secrets and pushes the payload to the Twitter API. Finally, it commits the updated state file back to the repository.
+1. **Trigger:** An external scheduler pings the GitHub API at the 11-minute mark of every hour.
+2. **Execute:** The GitHub Action environment spins up, authenticates via secure tokens, and executes the Python processing logic.
+3. **State Management:** The script compares current FPL API state with a local `fpl_state.json` file to filter out redundant alerts (e.g., preventing duplicate injury notifications).
+4. **Commit:** The system commits the updated state file back to the repository, ensuring continuity for the next hourly execution.
+
+## 🚀 Professional Engineering Highlights
+* **Decoupled Architecture:** Moved away from non-deterministic native cron to an API-driven event pattern.
+* **API Versioning:** Implemented explicit GitHub API versioning (`2022-11-28`) for production stability.
+* **Security-First:** Implemented fine-grained Personal Access Tokens (PATs) with 30-day rotation cycles to mirror enterprise IAM best practices.
 
 ## 🚀 Setup & Deployment (For Developers)
 
