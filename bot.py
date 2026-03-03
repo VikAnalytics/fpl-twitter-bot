@@ -40,14 +40,15 @@ def main():
             state = json.load(f)
     else:
         state = {"dgw": [], "injuries": {}}
-
-    # --- 1. CHECK 12-HOUR DEADLINE ---
+        
+# --- 1. CHECK 12-HOUR DEADLINE ---
     deadline = datetime.datetime.strptime(next_event['deadline_time'], "%Y-%m-%dT%H:%M:%SZ")
     time_diff = deadline - datetime.datetime.utcnow()
     
-    # Triggers only when the check happens exactly between 11 and 12 hours before deadline
-    if datetime.timedelta(hours=11) <= time_diff <= datetime.timedelta(hours=12):
-        send_tweet(f"🚨 FPL DEADLINE ALERT 🚨\n\nGameweek {next_event['id']} locks in exactly 12 hours! Double check your captains and bench. #FPL")
+    # Triggers the first time the bot wakes up and the deadline is under 12 hours away
+    if time_diff <= datetime.timedelta(hours=12) and next_event['id'] not in state.get('deadline_alert', []):
+        send_tweet(f"🚨 FPL DEADLINE ALERT 🚨\n\nGameweek {next_event['id']} locks in under 12 hours! Double check your captains and bench. #FPL")
+        state.setdefault('deadline_alert', []).append(next_event['id'])
 
     # --- 2. CHECK DOUBLE GAMEWEEKS ---
     gw_fixtures = [f for f in fpl_fixtures if f['event'] == next_event['id']]
