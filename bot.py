@@ -50,15 +50,20 @@ def main():
         send_tweet(f"🚨 FPL DEADLINE ALERT 🚨\n\nGameweek {next_event['id']} locks in under 12 hours! Double check your captains and bench. #FPL")
         state.setdefault('deadline_alert', []).append(next_event['id'])
 
-    # --- 2. CHECK DOUBLE GAMEWEEKS ---
+# --- 2. CHECK DOUBLE & BLANK GAMEWEEKS ---
+    # Create a dictionary to map team IDs to actual team names for the tweets
+    team_mapping = {team['id']: team['name'] for team in fpl_static['teams']}
+    
     gw_fixtures = [f for f in fpl_fixtures if f['event'] == next_event['id']]
     teams_playing = [f['team_a'] for f in gw_fixtures] + [f['team_h'] for f in gw_fixtures]
     
+    # -- Double Gameweek Logic --
     # If a team is listed more than once in the same Gameweek, it's a Double GW!
-    dgw_teams = [team for team in teams_playing if teams_playing.count(team) > 1]
+    dgw_team_ids = [team for team in set(teams_playing) if teams_playing.count(team) > 1]
     
-    if dgw_teams and next_event['id'] not in state.get('dgw', []):
-        send_tweet(f"🔥 DOUBLE GAMEWEEK DETECTED 🔥\n\nGet ready for DGW {next_event['id']}! Time to plan those transfers. #FPL")
+    if dgw_team_ids and next_event['id'] not in state.get('dgw', []):
+        dgw_names = [team_mapping[tid] for tid in dgw_team_ids]
+        send_tweet(f"🔥 DOUBLE GAMEWEEK DETECTED 🔥\n\nGet ready for DGW {next_event['id']}! Teams playing twice:\n{', '.join(dgw_names)}\n\n#FPL")
         state.setdefault('dgw', []).append(next_event['id'])
 
     # -- Blank Gameweek Logic --
