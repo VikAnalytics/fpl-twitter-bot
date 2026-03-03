@@ -2,7 +2,7 @@ name: FPL Twitter Bot Runner
 
 on:
   schedule:
-    - cron: '0 * * * *' # This tells the bot to run at the top of every hour
+  - cron: '33 * * * *'
   workflow_dispatch: # This creates a manual "Run" button so we can test it!
 
 permissions:
