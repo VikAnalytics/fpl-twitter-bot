@@ -60,6 +60,16 @@ def main():
         send_tweet(f"🔥 DOUBLE GAMEWEEK DETECTED 🔥\n\nGet ready for DGW {next_event['id']}! Time to plan those transfers. #FPL")
         state.setdefault('dgw', []).append(next_event['id'])
 
+    # -- Blank Gameweek Logic --
+    # If any of the 20 Premier League teams are NOT in the teams_playing list, it's a Blank GW!
+    all_team_ids = set(team_mapping.keys())
+    bgw_team_ids = list(all_team_ids - set(teams_playing))
+    
+    if bgw_team_ids and next_event['id'] not in state.get('bgw', []):
+        bgw_names = [team_mapping[tid] for tid in bgw_team_ids]
+        send_tweet(f"❌ BLANK GAMEWEEK DETECTED ❌\n\nThese teams have NO fixture in GW {next_event['id']}:\n{', '.join(bgw_names)}\n\nPlan your bench carefully! #FPL")
+        state.setdefault('bgw', []).append(next_event['id'])
+
     # --- 3. CHECK INJURIES ---
     current_injuries = {}
     # We only look at players owned by more than 5% of people to avoid spamming unknown players
@@ -74,6 +84,27 @@ def main():
         if pid not in old_injuries or old_injuries[pid]['status'] != info['status']:
             tweet_text = f"🏥 FPL INJURY UPDATE 🏥\n\n{info['name']}: {info['news']} ({info['status']}% chance of playing next round). #FPL"
             send_tweet(tweet_text)
+
+    # --- 4. TOP 3 PLAYERS OF LAST GW ---
+    # Find the gameweek that just finished
+    prev_event = next((e for e in fpl_static['events'] if e.get('is_previous')), None)
+    
+    # If a previous gameweek exists and we haven't tweeted its top players yet
+    if prev_event and prev_event['id'] not in state.get('top_players', []):
+        # Sort all players by their points in the last gameweek (highest to lowest)
+        all_players = fpl_static['elements']
+        top_3 = sorted(all_players, key=lambda x: x['event_points'], reverse=True)[:3]
+        
+        # Build the tweet
+        tweet_lines = [f"🌟 GW {prev_event['id']} KINGS OF THE GAMEWEEK 🌟\n"]
+        for idx, player in enumerate(top_3, 1):
+            tweet_lines.append(f"{idx}. {player['web_name']} - {player['event_points']} pts")
+            
+        tweet_lines.append("\n#FPL")
+        
+        # Send the tweet and save to memory so it only posts once
+        send_tweet("\n".join(tweet_lines))
+        state.setdefault('top_players', []).append(prev_event['id'])
 
     # --- SAVE MEMORY ---
     state['injuries'] = current_injuries
