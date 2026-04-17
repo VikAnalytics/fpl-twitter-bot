@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "FPL Gaffer — Squad Analysis & Transfer Advisor",
   "version": "1.0.0",
-  "description": "Instant AI-powered squad analysis on the FPL website. See injury flags, double/blank gameweek exposure, and grounded transfer recommendations — without leaving the page.",
-  "permissions": ["storage"],
+  "description": "AI-powered FPL squad analysis. Injury flags, DGW/BGW exposure, and transfer recommendations — without leaving the FPL website.",
+  "permissions": [],
   "host_permissions": [
     "https://fantasy.premierleague.com/*",
     "https://*.onrender.com/*",
