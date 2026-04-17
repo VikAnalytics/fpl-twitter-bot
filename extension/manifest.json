@@ -7,8 +7,7 @@
   "host_permissions": [
     "https://fantasy.premierleague.com/*",
     "https://*.onrender.com/*",
-    "https://*.up.railway.app/*",
-    "http://localhost:*/*"
+    "https://*.up.railway.app/*"
   ],
   "content_scripts": [
     {
