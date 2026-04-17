@@ -1,12 +1,12 @@
 import requests
-import json
 import os
 import datetime
 import tweepy
-from pathlib import Path
 
-# --- SETUP TWITTER CONNECTION ---
-# This safely pulls your hidden secret keys to log into your bot's Twitter account
+from app.database import init_db, get_full_bot_state, set_full_bot_state
+
+init_db()
+
 client = tweepy.Client(
     consumer_key=os.environ.get("TWITTER_CONSUMER_KEY"),
     consumer_secret=os.environ.get("TWITTER_CONSUMER_SECRET"),
@@ -33,13 +33,14 @@ def main():
     if not next_event: 
         return
         
-    # Set up a "memory" file so the bot doesn't tweet the same injury twice
-    state_file = Path("fpl_state.json")
-    if state_file.exists():
-        with open(state_file, "r") as f:
-            state = json.load(f)
-    else:
-        state = {"dgw": [], "injuries": {}}
+    _stored = get_full_bot_state()
+    state = {
+        "dgw": _stored.get("dgw", []),
+        "bgw": _stored.get("bgw", []),
+        "injuries": _stored.get("injuries", {}),
+        "deadline_alert": _stored.get("deadline_alert", []),
+        "top_players": _stored.get("top_players", []),
+    }
         
 # --- 1. CHECK 12-HOUR DEADLINE ---
     deadline = datetime.datetime.strptime(next_event['deadline_time'], "%Y-%m-%dT%H:%M:%SZ")
@@ -112,10 +113,8 @@ def main():
         send_tweet("\n".join(tweet_lines))
         state.setdefault('top_players', []).append(prev_event['id'])
 
-    # --- SAVE MEMORY ---
     state['injuries'] = current_injuries
-    with open(state_file, "w") as f:
-        json.dump(state, f)
+    set_full_bot_state(state)
 
 if __name__ == "__main__":
     main()

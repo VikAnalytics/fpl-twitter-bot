@@ -1,0 +1,293 @@
+{% extends "base.html" %}
+{% block title %}Vibe Check — {{ result.manager.team_name }}{% endblock %}
+
+{% block extra_styles %}
+<style>
+  .page-hdr { margin-bottom: 40px; animation: fadeUp 0.3s ease both; }
+  .page-eyebrow {
+    font-family: var(--font-mono);
+    font-size: 0.58rem;
+    color: var(--blue);
+    letter-spacing: 0.24em;
+    text-transform: uppercase;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .page-eyebrow::before {
+    content: '';
+    width: 20px; height: 2px;
+    background: var(--blue);
+    display: block;
+    box-shadow: var(--blue-glow);
+  }
+  .page-hdr h1 {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: clamp(2rem, 5vw, 3.8rem);
+    letter-spacing: 0.02em;
+    line-height: 0.92;
+    text-transform: uppercase;
+  }
+  .page-hdr .sub { margin-top: 10px; color: var(--text-muted); font-size: 0.88rem; font-weight: 300; }
+
+  /* ── VIBE CARD ── */
+  .vibe-card {
+    background: linear-gradient(135deg, rgba(56,189,248,0.05) 0%, rgba(7,13,26,0.5) 60%, transparent 100%);
+    border: 1px solid var(--border-blue);
+    border-left: 4px solid var(--blue);
+    padding: 32px 36px;
+    margin-bottom: 24px;
+    position: relative;
+    overflow: hidden;
+    animation: fadeUp 0.4s ease both;
+  }
+  .vibe-card::after {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, var(--blue), var(--amber), transparent);
+    animation: shimmer 4.5s ease-in-out infinite;
+  }
+  .vibe-open {
+    font-family: var(--font-display);
+    font-size: 4.5rem;
+    font-weight: 700;
+    color: var(--blue);
+    opacity: 0.25;
+    line-height: 0;
+    display: block;
+    margin-bottom: 16px;
+    user-select: none;
+  }
+  .vibe-text {
+    font-family: var(--font-body);
+    font-size: 1rem;
+    font-weight: 300;
+    line-height: 1.82;
+    color: var(--text);
+  }
+
+  /* ── CAPTAIN BANNER ── */
+  .captain-banner {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    background: rgba(245,158,11,0.04);
+    border: 1px solid rgba(245,158,11,0.2);
+    border-left: 4px solid var(--amber);
+    padding: 16px 24px;
+    margin-bottom: 24px;
+    animation: fadeUp 0.4s 0.08s ease both;
+  }
+  .cap-icon { font-size: 1.3rem; flex-shrink: 0; }
+  .cap-info { flex: 1; min-width: 0; }
+  .cap-lbl {
+    font-family: var(--font-mono);
+    font-size: 0.55rem;
+    color: var(--text-muted);
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    margin-bottom: 4px;
+  }
+  .cap-name {
+    font-family: var(--font-display);
+    font-size: 1.35rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: var(--amber);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* ── INJURY GRID ── */
+  .injury-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 10px;
+    margin-bottom: 24px;
+  }
+  .injury-card {
+    background: rgba(244,63,94,0.04);
+    border: 1px solid rgba(244,63,94,0.18);
+    border-left: 3px solid var(--rose);
+    padding: 16px 18px;
+    animation: fadeUp 0.4s ease both;
+    transition: background var(--transition);
+  }
+  .injury-card:hover { background: rgba(244,63,94,0.07); }
+  .inj-name {
+    font-family: var(--font-display);
+    font-size: 1rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    margin-bottom: 5px;
+  }
+  .inj-news {
+    font-family: var(--font-mono);
+    font-size: 0.61rem;
+    color: var(--text-muted);
+    line-height: 1.55;
+    margin-bottom: 12px;
+  }
+  .inj-meta { display: flex; justify-content: space-between; align-items: center; }
+  .chance-bar { height: 2px; background: rgba(255,255,255,0.07); margin-top: 10px; border-radius: 1px; overflow: hidden; }
+  .chance-fill { height: 100%; background: var(--rose); transition: width 0.8s ease; }
+  .chance-fill.ok { background: var(--emerald); }
+
+  /* ── CTA ── */
+  .cta-wrap { text-align: center; margin-top: 32px; }
+  .cta-link {
+    display: inline-block;
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 0.95rem;
+    color: #080d1a;
+    background: var(--blue);
+    text-decoration: none;
+    letter-spacing: 0.14em;
+    padding: 14px 44px;
+    transition: box-shadow var(--transition-md), transform var(--transition), filter var(--transition);
+    text-transform: uppercase;
+    cursor: pointer;
+    touch-action: manipulation;
+  }
+  .cta-link:hover { box-shadow: var(--blue-glow); transform: translateY(-1px); filter: brightness(1.08); }
+  .cta-link:active { transform: translateY(0); }
+
+  .table-wrap { border: 1px solid var(--border); overflow: hidden; animation: fadeUp 0.4s 0.2s ease both; }
+
+  @media (max-width: 640px) {
+    .captain-banner { flex-wrap: wrap; gap: 12px; }
+    .vibe-card { padding: 22px 20px; }
+    .injury-grid { grid-template-columns: 1fr; }
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-hdr">
+  <div class="page-eyebrow">Squad Audit // GW{{ result.manager.current_gameweek }}</div>
+  <h1>{{ result.manager.team_name }}</h1>
+  <p class="sub">{{ result.manager.name }}</p>
+</div>
+
+<div class="stat-row d1" style="animation: fadeUp 0.4s ease both; margin-bottom: 32px;">
+  <div class="stat">
+    <span class="stat-val">{{ "{:,}".format(result.manager.overall_rank) }}</span>
+    <span class="stat-label">Overall Rank</span>
+  </div>
+  <div class="stat">
+    <span class="stat-val amber">{{ result.manager.total_points }}</span>
+    <span class="stat-label">Total Points</span>
+  </div>
+  <div class="stat">
+    <span class="stat-val rose">{{ result.injury_flags|length }}</span>
+    <span class="stat-label">Injury Flags</span>
+  </div>
+</div>
+
+<div class="card-label d2" style="animation: fadeUp 0.4s ease both;">// GPT-4o Vibe Check</div>
+<div class="vibe-card d2">
+  <span class="vibe-open" aria-hidden="true">"</span>
+  <p class="vibe-text">{{ result.vibe_check_narrative }}</p>
+</div>
+
+<div class="captain-banner d3">
+  <span class="cap-icon" aria-hidden="true">★</span>
+  <div class="cap-info">
+    <div class="cap-lbl">Captain Pick</div>
+    <div class="cap-name">{% for pick in result.squad %}{% if pick.is_captain %}{{ pick.player.web_name }}{% endif %}{% endfor %}</div>
+  </div>
+  {% if result.captain_score == "Good" %}
+    <span class="badge badge-emerald">✓ Good Pick</span>
+  {% elif result.captain_score == "Risky" %}
+    <span class="badge badge-amber">⚠ Risky</span>
+  {% else %}
+    <span class="badge badge-rose">✗ Poor Pick</span>
+  {% endif %}
+</div>
+
+{% if result.injury_flags %}
+<div class="card-label d3" style="animation: fadeUp 0.4s ease both;">// Injury Radar</div>
+<div class="injury-grid">
+  {% for p in result.injury_flags %}
+  <div class="injury-card" style="animation-delay: {{ loop.index0 * 0.05 }}s;">
+    <div class="inj-name">{{ p.web_name }}</div>
+    <div class="inj-news">{{ p.news or "Injury concern" }}</div>
+    <div class="inj-meta">
+      {% if p.chance_of_playing_next_round is not none %}
+        <span class="badge badge-orange">{{ p.chance_of_playing_next_round }}% chance</span>
+      {% else %}
+        <span class="badge badge-dim">Doubt</span>
+      {% endif %}
+      <span style="font-family:var(--font-mono);font-size:0.57rem;color:var(--text-muted);">{{ p.team_name }}</span>
+    </div>
+    {% if p.chance_of_playing_next_round is not none %}
+    <div class="chance-bar">
+      <div class="chance-fill {{ 'ok' if p.chance_of_playing_next_round >= 75 }}" style="width:{{ p.chance_of_playing_next_round }}%;"></div>
+    </div>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+<div class="divider"></div>
+
+<div class="card-label d4" style="animation: fadeUp 0.4s ease both;">// Full Squad</div>
+<div class="table-wrap">
+  <table class="data-table" role="table">
+    <thead>
+      <tr>
+        <th scope="col">Pos</th><th scope="col">Player</th><th scope="col">Team</th>
+        <th scope="col">£m</th><th scope="col">Form</th><th scope="col">ep↑</th>
+        <th scope="col">Pts</th><th scope="col">Fixtures</th><th scope="col">Status</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% set ns = namespace(bench=false) %}
+      {% for pick in result.squad %}
+        {% if pick.position == 12 and not ns.bench %}
+          {% set ns.bench = true %}
+          <tr><td colspan="9" class="bench-sep">— Bench —</td></tr>
+        {% endif %}
+        <tr class="{{ 'captain-row' if pick.is_captain }} {{ 'injured' if pick.player.chance_of_playing_next_round is not none and pick.player.chance_of_playing_next_round < 75 }}">
+          <td><span class="pos-badge pos-{{ pick.player.position|lower }}">{{ pick.player.position }}</span></td>
+          <td>
+            {{ pick.player.web_name }}
+            {% if pick.is_captain %}<span class="badge badge-amber" style="padding:1px 5px;margin-left:5px;">C</span>{% endif %}
+            {% if pick.is_vice_captain %}<span class="badge badge-dim" style="padding:1px 5px;margin-left:5px;">V</span>{% endif %}
+          </td>
+          <td style="color:var(--text-muted);">{{ pick.player.team_name }}</td>
+          <td style="color:var(--text-muted);font-variant-numeric:tabular-nums;">{{ pick.player.now_cost }}</td>
+          <td style="color:var(--indigo);font-variant-numeric:tabular-nums;">{{ pick.player.form }}</td>
+          <td style="color:var(--blue);font-variant-numeric:tabular-nums;">{{ pick.player.ep_next }}</td>
+          <td style="font-variant-numeric:tabular-nums;">{{ pick.player.total_points }}</td>
+          <td>
+            <div class="fixture-chips">
+              {% for fix in pick.player.fixtures_next_3 %}
+                <span class="fixture-chip fdr-{{ fix.fdr }}">{{ fix.opp }}({{ fix.venue }})</span>
+              {% endfor %}
+            </div>
+          </td>
+          <td>
+            {% if pick.player.chance_of_playing_next_round is not none %}
+              <span class="status-dot {{ 'dot-orange' if pick.player.chance_of_playing_next_round >= 50 else 'dot-red' }}"></span>{{ pick.player.chance_of_playing_next_round }}%
+            {% else %}
+              <span class="status-dot dot-green"></span><span style="color:var(--text-muted)">Fit</span>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="cta-wrap">
+  <a class="cta-link" href="/brief/{{ result.manager.id }}">Pre-Deadline Brief →</a>
+</div>
+{% endblock %}

@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "FPL Gaffer — Squad Analysis & Transfer Advisor",
+  "version": "1.0.0",
+  "description": "Instant AI-powered squad analysis on the FPL website. See injury flags, double/blank gameweek exposure, and grounded transfer recommendations — without leaving the page.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://fantasy.premierleague.com/*",
+    "https://*.onrender.com/*",
+    "https://*.up.railway.app/*",
+    "http://localhost:*/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://fantasy.premierleague.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "FPL Gaffer Settings",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}

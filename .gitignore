@@ -1,0 +1,23 @@
+# environment
+.env
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# macos
+.DS_Store
+
+# legacy flat-file state (replaced by SQLite)
+fpl_state.json
+managers.json
+
+# build output
+fpl-gaffer-extension.zip
+
+# tools
+graphify-out/
+.obsidian/
