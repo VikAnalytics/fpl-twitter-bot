@@ -25,9 +25,17 @@ def main():
     # --- FETCH FPL DATA ---
 
     
-    fpl_static = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/").json()
-    fpl_fixtures = requests.get("https://fantasy.premierleague.com/api/fixtures/").json()
-    
+    r_static = requests.get("https://fantasy.premierleague.com/api/bootstrap-static/", timeout=30)
+    r_static.raise_for_status()
+    fpl_static = r_static.json()
+    if not isinstance(fpl_static, dict) or 'events' not in fpl_static:
+        print(f"Unexpected FPL API response: {str(fpl_static)[:200]}")
+        return
+
+    r_fixtures = requests.get("https://fantasy.premierleague.com/api/fixtures/", timeout=30)
+    r_fixtures.raise_for_status()
+    fpl_fixtures = r_fixtures.json()
+
     # Find the upcoming gameweek
     next_event = next((e for e in fpl_static['events'] if e['is_next']), None)
     if not next_event: 
