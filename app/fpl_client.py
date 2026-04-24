@@ -57,9 +57,9 @@ def fetch_manager_info(manager_id: int, bootstrap: dict) -> ManagerInfo:
     )
 
 
-def fetch_current_picks(manager_id: int, gameweek: int) -> tuple[list[dict], dict]:
+def fetch_current_picks(manager_id: int, gameweek: int) -> tuple[list[dict], dict, str | None]:
     data = _get(f"{FPL_BASE}/entry/{manager_id}/event/{gameweek}/picks/")
-    return data.get("picks", []), data.get("entry_history", {})
+    return data.get("picks", []), data.get("entry_history", {}), data.get("active_chip")
 
 
 def fetch_transfer_history(manager_id: int) -> list[dict]:
@@ -158,31 +158,166 @@ def build_team_lookup(bootstrap: dict) -> dict[int, str]:
     return {t["id"]: t["short_name"] for t in bootstrap["teams"]}
 
 
-def get_next_3_fixtures(
+def build_team_strength_lookup(bootstrap: dict) -> dict[int, dict]:
+    """team_id -> {attack_home, attack_away, defence_home, defence_away, overall_home, overall_away}."""
+    return {
+        t["id"]: {
+            "attack_home":   t.get("strength_attack_home",   1100),
+            "attack_away":   t.get("strength_attack_away",   1100),
+            "defence_home":  t.get("strength_defence_home",  1100),
+            "defence_away":  t.get("strength_defence_away",  1100),
+            "overall_home":  t.get("strength_overall_home",  1100),
+            "overall_away":  t.get("strength_overall_away",  1100),
+        }
+        for t in bootstrap["teams"]
+    }
+
+
+def _directional_fdr(
+    player_position: str,
+    own_team_id: int,
+    opp_team_id: int,
+    venue: str,
+    strength: dict[int, dict],
+    base_fdr: int,
+) -> float:
+    """
+    Position-aware difficulty.
+    Attacking assets (MID/FWD, attacking DEF): opp defence strength matters.
+    Defensive assets (GKP + CB-type DEF): opp attack strength matters.
+    Returns a 1.0–5.0 float (lower = easier). Mixes base FDR with strength delta.
+    """
+    own = strength.get(own_team_id)
+    opp = strength.get(opp_team_id)
+    if not own or not opp:
+        return float(base_fdr)
+
+    if player_position in ("MID", "FWD"):
+        opp_rating = opp["defence_home"] if venue == "A" else opp["defence_away"]
+        own_rating = own["attack_home"]  if venue == "H" else own["attack_away"]
+    else:  # GKP, DEF — defensive return matters more (CS prob)
+        opp_rating = opp["attack_home"]  if venue == "A" else opp["attack_away"]
+        own_rating = own["defence_home"] if venue == "H" else own["defence_away"]
+
+    # Normalize: strength typically 1000–1400. Delta / 100 shifts FDR by ±1
+    delta = (opp_rating - own_rating) / 100.0
+    directional = base_fdr + (delta * 0.5)
+    return max(1.0, min(5.0, directional))
+
+
+def get_next_fixtures(
     team_id: int,
     current_gw: int,
     fixtures: list[dict],
     team_lookup: dict[int, str],
+    n: int = 3,
+    player_position: str | None = None,
+    strength_lookup: dict[int, dict] | None = None,
 ) -> list[Fixture]:
     result = []
     for fix in fixtures:
         if fix["event"] is None or fix["event"] < current_gw:
             continue
         if fix["team_h"] == team_id:
-            result.append(Fixture(
-                opp=team_lookup.get(fix["team_a"], "?"),
-                venue="H",
-                fdr=fix.get("team_h_difficulty") or 3,
-            ))
+            opp_id = fix["team_a"]
+            venue = "H"
+            base_fdr = fix.get("team_h_difficulty") or 3
         elif fix["team_a"] == team_id:
-            result.append(Fixture(
-                opp=team_lookup.get(fix["team_h"], "?"),
-                venue="A",
-                fdr=fix.get("team_a_difficulty") or 3,
-            ))
-        if len(result) == 3:
+            opp_id = fix["team_h"]
+            venue = "A"
+            base_fdr = fix.get("team_a_difficulty") or 3
+        else:
+            continue
+
+        directional = None
+        if player_position and strength_lookup:
+            directional = _directional_fdr(
+                player_position, team_id, opp_id, venue, strength_lookup, base_fdr
+            )
+
+        result.append(Fixture(
+            opp=team_lookup.get(opp_id, "?"),
+            venue=venue,
+            fdr=base_fdr,
+            directional_fdr=directional,
+        ))
+        if len(result) == n:
             break
     return result
+
+
+# Back-compat shim
+def get_next_3_fixtures(
+    team_id: int,
+    current_gw: int,
+    fixtures: list[dict],
+    team_lookup: dict[int, str],
+) -> list[Fixture]:
+    return get_next_fixtures(team_id, current_gw, fixtures, team_lookup, n=3)
+
+
+_YC_THRESHOLDS = (5, 10, 15)
+
+
+def _build_player_summary(
+    p: dict,
+    team_name_lookup: dict[int, str],
+    team_lookup: dict[int, str],
+    current_gw: int,
+    fixtures: list[dict],
+    strength_lookup: dict[int, dict],
+    recent_form: list[int],
+) -> PlayerSummary:
+    chance = p.get("chance_of_playing_next_round")
+    position = p["position_label"]
+    starts = int(p.get("starts") or 0)
+    minutes = int(p.get("minutes") or 0)
+    yc = int(p.get("yellow_cards") or 0)
+    # suspension: one YC from threshold
+    suspension_risk = any(yc == thr - 1 for thr in _YC_THRESHOLDS)
+    # appearances proxy: starts + (minutes > 0 but not started) is harder to derive; use starts as floor
+    appearances = starts  # best available proxy from bootstrap
+
+    return PlayerSummary(
+        id=p["id"],
+        web_name=p["web_name"],
+        team_name=team_name_lookup.get(p["team"], ""),
+        position=position,
+        total_points=p["total_points"],
+        form=float(p.get("form") or 0),
+        selected_by_percent=float(p.get("selected_by_percent") or 0),
+        now_cost=round((p.get("now_cost") or 0) / 10, 1),
+        ep_next=float(p.get("ep_next") or 0),
+        points_per_game=float(p.get("points_per_game") or 0),
+        recent_form_5gw=recent_form,
+        chance_of_playing_next_round=int(chance) if chance is not None else None,
+        news=p.get("news") or "",
+        news_added=p.get("news_added"),
+        fixtures_next_3=get_next_fixtures(
+            p["team"], current_gw, fixtures, team_lookup,
+            n=3, player_position=position, strength_lookup=strength_lookup,
+        ),
+        xg=float(p.get("expected_goals") or 0),
+        xa=float(p.get("expected_assists") or 0),
+        xgi_per_90=float(p.get("expected_goal_involvements_per_90") or 0),
+        xgc_per_90=float(p.get("expected_goals_conceded_per_90") or 0),
+        goals_scored=int(p.get("goals_scored") or 0),
+        assists=int(p.get("assists") or 0),
+        clean_sheets=int(p.get("clean_sheets") or 0),
+        minutes=minutes,
+        starts=starts,
+        appearances=appearances,
+        starts_pct=min(100.0, round(starts / max(current_gw - 1, 1) * 100.0, 1)),
+        yellow_cards=yc,
+        suspension_risk=suspension_risk,
+        penalties_order=p.get("penalties_order"),
+        direct_freekicks_order=p.get("direct_freekicks_order"),
+        corners_order=p.get("corners_and_indirect_freekicks_order"),
+        cost_change_event=int(p.get("cost_change_event") or 0),
+        transfers_in_event=int(p.get("transfers_in_event") or 0),
+        transfers_out_event=int(p.get("transfers_out_event") or 0),
+        role_score=float(p.get("expected_goal_involvements_per_90") or 0),
+    )
 
 
 def build_squad_picks(
@@ -193,29 +328,19 @@ def build_squad_picks(
     fixtures: list[dict],
     bootstrap: dict,
     recent_forms: dict[int, list[int]] | None = None,
+    strength_lookup: dict[int, dict] | None = None,
 ) -> list[SquadPick]:
     team_name_lookup = {t["id"]: t["name"] for t in bootstrap["teams"]}
+    if strength_lookup is None:
+        strength_lookup = build_team_strength_lookup(bootstrap)
     picks = []
     for pick in raw_picks:
         p = player_lookup.get(pick["element"])
         if not p:
             continue
-        chance = p.get("chance_of_playing_next_round")
-        player = PlayerSummary(
-            id=p["id"],
-            web_name=p["web_name"],
-            team_name=team_name_lookup.get(p["team"], ""),
-            position=p["position_label"],
-            total_points=p["total_points"],
-            form=float(p.get("form") or 0),
-            selected_by_percent=float(p.get("selected_by_percent") or 0),
-            now_cost=round((p.get("now_cost") or 0) / 10, 1),
-            ep_next=float(p.get("ep_next") or 0),
-            points_per_game=float(p.get("points_per_game") or 0),
-            recent_form_5gw=(recent_forms or {}).get(p["id"], []),
-            chance_of_playing_next_round=int(chance) if chance is not None else None,
-            news=p.get("news") or "",
-            fixtures_next_3=get_next_3_fixtures(p["team"], current_gw, fixtures, team_lookup),
+        player = _build_player_summary(
+            p, team_name_lookup, team_lookup, current_gw, fixtures,
+            strength_lookup, (recent_forms or {}).get(p["id"], []),
         )
         picks.append(SquadPick(
             player=player,
@@ -255,19 +380,28 @@ def find_valid_replacements(
     team_name_lookup: dict[int, str],
     current_gw: int,
     fixtures: list[dict],
+    strength_lookup: dict[int, dict] | None = None,
+    recently_sold_ids: set[int] | None = None,
     top_n: int = 8,
+    enrich_form: bool = True,
 ) -> list[PlayerSummary]:
     """
-    Return top_n valid in-market replacements for sell_player.
-    Filters: same FPL position, affordable, not same club, not already owned.
+    Return top_n composite-ranked replacements for sell_player.
+    Filters: same FPL position, affordable, not same club, not already owned,
+    not sold within last 3 GWs (if recently_sold_ids given), minutes floor.
+    Ranking done by ranking.score_buy; top ~15 enriched with recent_form_5gw.
     """
+    from . import ranking
+
     owned_ids = {pick.player.id for pick in squad}
+    excluded = owned_ids | (recently_sold_ids or set())
     position = sell_player.position
     exclude_club = sell_player.team_name
 
-    candidates: list[PlayerSummary] = []
+    # Build summaries for all feasible candidates (no form yet — expensive)
+    feasible: list[PlayerSummary] = []
     for pid, p in player_lookup.items():
-        if pid in owned_ids:
+        if pid in excluded:
             continue
         if p.get("position_label") != position:
             continue
@@ -277,26 +411,40 @@ def find_valid_replacements(
         price = round((p.get("now_cost") or 0) / 10, 1)
         if price > budget_max:
             continue
-        ep = float(p.get("ep_next") or 0)
-        short_team = team_lookup.get(p["team"], "?")
-        fixtures_next_3 = get_next_3_fixtures(p["team"], current_gw, fixtures, team_lookup)
-        candidates.append(PlayerSummary(
-            id=pid,
-            web_name=p["web_name"],
-            team_name=club_name,
-            position=position,
-            total_points=p.get("total_points", 0),
-            form=float(p.get("form") or 0),
-            selected_by_percent=float(p.get("selected_by_percent") or 0),
-            now_cost=price,
-            ep_next=ep,
-            points_per_game=float(p.get("points_per_game") or 0),
-            recent_form_5gw=[],
-            fixtures_next_3=fixtures_next_3,
-        ))
+        # minutes floor — skip pure bench fodder (unless early season)
+        minutes = int(p.get("minutes") or 0)
+        if current_gw > 6 and minutes < (current_gw - 1) * 30:
+            continue
+        chance = p.get("chance_of_playing_next_round")
+        if chance is not None and chance < 50:
+            continue
+        summary = _build_player_summary(
+            p,
+            team_name_lookup,
+            team_lookup,
+            current_gw,
+            fixtures,
+            strength_lookup or {},
+            [],  # form added later for top-N
+        )
+        feasible.append(summary)
 
-    candidates.sort(key=lambda x: x.ep_next, reverse=True)
-    return candidates[:top_n]
+    if not feasible:
+        return []
+
+    # First-pass rank by composite (no form trend yet)
+    feasible.sort(key=lambda x: ranking.score_buy(x, sell_player), reverse=True)
+    shortlist = feasible[: max(top_n * 2, 15)]
+
+    # Enrich shortlist with recent_form_5gw (parallel fetch)
+    if enrich_form and shortlist:
+        forms = fetch_squad_recent_forms([c.id for c in shortlist])
+        for c in shortlist:
+            c.recent_form_5gw = forms.get(c.id, [])
+
+    # Re-rank with form trend available
+    shortlist.sort(key=lambda x: ranking.score_buy(x, sell_player), reverse=True)
+    return shortlist[:top_n]
 
 
 def detect_dgw_bgw(

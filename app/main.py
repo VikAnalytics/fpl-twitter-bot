@@ -20,6 +20,7 @@ from .fpl_client import (
     build_player_lookup,
     build_squad_picks,
     build_team_lookup,
+    build_team_strength_lookup,
     detect_dgw_bgw,
     fetch_bootstrap,
     fetch_current_picks,
@@ -35,6 +36,7 @@ from .fpl_client import (
 )
 from .llm import generate_pre_deadline_brief, generate_vibe_check
 from .models import AuditResult, BriefResult, PlayerSummary, TransferOutcome
+from . import ranking
 
 app = FastAPI(title="FPL Gaffer")
 
@@ -142,18 +144,22 @@ def _build_brief(manager_id: int) -> BriefResult:
 
     # ── Full pipeline ──────────────────────────────────────────────────────────
     manager = fetch_manager_info(manager_id, bootstrap)
-    raw_picks, entry_history = fetch_current_picks(manager_id, gw)
+    raw_picks, entry_history, active_chip = fetch_current_picks(manager_id, gw)
     fixtures = fetch_fixtures()
     player_lookup = build_player_lookup(bootstrap)
     team_lookup = build_team_lookup(bootstrap)
     team_name_lookup = {t["id"]: t["name"] for t in bootstrap["teams"]}
     team_name_to_id = {t["name"]: t["id"] for t in bootstrap["teams"]}
+    strength_lookup = build_team_strength_lookup(bootstrap)
 
     transfer_history = fetch_transfer_history(manager_id)
     past_outcomes = _evaluate_pending_outcomes(manager_id, gw, transfer_history)
     player_ids = [p["element"] for p in raw_picks]
     recent_forms = fetch_squad_recent_forms(player_ids)
-    squad = build_squad_picks(raw_picks, player_lookup, team_lookup, gw, fixtures, bootstrap, recent_forms)
+    squad = build_squad_picks(
+        raw_picks, player_lookup, team_lookup, gw, fixtures, bootstrap,
+        recent_forms, strength_lookup,
+    )
 
     injury_flags: list[PlayerSummary] = [
         pick.player for pick in squad
@@ -169,25 +175,42 @@ def _build_brief(manager_id: int) -> BriefResult:
     dgw_players = [p.player for p in squad if team_name_to_id.get(p.player.team_name) in dgw_team_ids]
     bgw_players = [p.player for p in squad if team_name_to_id.get(p.player.team_name) in bgw_team_ids]
 
+    # ── Rank sell candidates first (XI only) ──────────────────────────────────
+    xi_picks = [p for p in squad if p.position <= 11]
+    sell_reports = sorted(
+        (ranking.score_sell(pk.player, gw) for pk in xi_picks),
+        key=lambda r: r.score,
+        reverse=True,
+    )
+    top_sell_reports = sell_reports[:5]
+
+    # ── Ground targets against the actual top sell candidates ────────────────
+    recent_sold_ids = ranking.recently_sold_ids(transfer_history, gw, lookback=3)
     grounded_targets: dict[str, list] = {}
-    for pick in [p for p in squad if p.position <= 11][:6]:
+    for report in top_sell_reports:
+        sell_p = report.player
         replacements = find_valid_replacements(
-            sell_player=pick.player,
-            budget_max=round(pick.player.now_cost + budget.itb, 1),
+            sell_player=sell_p,
+            budget_max=round(sell_p.now_cost + budget.itb, 1),
             squad=squad,
             player_lookup=player_lookup,
             team_lookup=team_lookup,
             team_name_lookup=team_name_lookup,
             current_gw=gw,
             fixtures=fixtures,
+            strength_lookup=strength_lookup,
+            recently_sold_ids=recent_sold_ids,
         )
         if replacements:
-            grounded_targets[pick.player.web_name] = replacements
+            grounded_targets[sell_p.web_name] = replacements
 
     narrative, transfers = generate_pre_deadline_brief(
         manager, squad, injury_flags, dgw_players, bgw_players,
         deadline_str, transfer_history, budget, league_standings,
         grounded_targets=grounded_targets,
+        sell_reports=top_sell_reports,
+        active_chip=active_chip,
+        past_outcomes=past_outcomes,
     )
 
     _save_suggestions(manager_id, gw, transfers, squad, player_lookup)
@@ -237,13 +260,17 @@ async def audit(request: Request, manager_id: int = Form(...)):
         raise
 
     gw = get_current_gameweek(bootstrap)
-    raw_picks, _ = fetch_current_picks(manager_id, gw)
+    raw_picks, _, _ = fetch_current_picks(manager_id, gw)
     fixtures = fetch_fixtures()
     player_lookup = build_player_lookup(bootstrap)
     team_lookup = build_team_lookup(bootstrap)
+    strength_lookup = build_team_strength_lookup(bootstrap)
     player_ids = [p["element"] for p in raw_picks]
     recent_forms = fetch_squad_recent_forms(player_ids)
-    squad = build_squad_picks(raw_picks, player_lookup, team_lookup, gw, fixtures, bootstrap, recent_forms)
+    squad = build_squad_picks(
+        raw_picks, player_lookup, team_lookup, gw, fixtures, bootstrap,
+        recent_forms, strength_lookup,
+    )
 
     injury_flags: list[PlayerSummary] = [
         pick.player for pick in squad

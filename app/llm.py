@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from openai import OpenAI, APIError, RateLimitError
-from .models import BudgetInfo, Fixture, LeagueStanding, ManagerInfo, PlayerSummary, SquadPick, TransferRecommendation
+
+from . import ranking
+from .models import (
+    BudgetInfo, Fixture, LeagueStanding, ManagerInfo, PlayerSummary,
+    SquadPick, TransferOutcome, TransferRecommendation,
+)
 
 _client: OpenAI | None = None
 
@@ -18,96 +24,40 @@ def _get_client() -> OpenAI:
 _FALLBACK = "Analysis temporarily unavailable. Try again in a moment."
 
 
-def _form_trend(form_5gw: list) -> str:
-    if not form_5gw or len(form_5gw) < 3:
-        return "UNKNOWN"
-    recent = sum(form_5gw[:2]) / 2
-    older  = sum(form_5gw[2:]) / len(form_5gw[2:])
-    diff = recent - older
-    if diff <= -1.5:  return "DECLINING ↓↓"
-    if diff <  -0.5:  return "DIPPING ↓"
-    if diff >=  1.5:  return "RISING ↑↑"
-    if diff >   0.5:  return "IMPROVING ↑"
-    return "STABLE →"
-
+# ─────────────────────── Formatting helpers ───────────────────────
 
 def _fixture_summary(fixtures: list[Fixture]) -> str:
-    """Full 3-fixture breakdown with FDRs and avg difficulty."""
     if not fixtures:
         return "No fixtures"
-    parts = [f"{f.opp}({f.venue}) FDR{f.fdr}" for f in fixtures]
-    avg_fdr = sum(f.fdr for f in fixtures) / len(fixtures)
+    parts = []
+    for f in fixtures:
+        if f.directional_fdr is not None:
+            parts.append(f"{f.opp}({f.venue}) FDR{f.fdr}/dFDR{f.directional_fdr:.1f}")
+        else:
+            parts.append(f"{f.opp}({f.venue}) FDR{f.fdr}")
+    avg_fdr = sum((f.directional_fdr if f.directional_fdr is not None else f.fdr) for f in fixtures) / len(fixtures)
     difficulty = "HARD" if avg_fdr >= 4 else ("TOUGH" if avg_fdr >= 3.3 else ("MIXED" if avg_fdr >= 2.7 else "EASY"))
-    return f"{', '.join(parts)} | Avg FDR {avg_fdr:.1f} ({difficulty})"
+    return f"{', '.join(parts)} | Avg {avg_fdr:.1f} ({difficulty})"
 
 
-def _sell_candidates(squad: list[SquadPick]) -> str:
-    """
-    Score every starting XI player and surface the weakest ones.
-    Always returns at least 3 candidates (worst-ranked, even if form is stable),
-    so GPT always has targets to work with.
-    """
-    scored = []
-    for pick in squad:
-        if pick.position > 11:
-            continue
-        p = pick.player
-        flags = []
-        score = 0  # higher = more urgent to sell
-
-        # injury / doubt (highest priority)
-        if p.chance_of_playing_next_round is not None and p.chance_of_playing_next_round < 75:
-            flags.append(f"injury doubt ({p.chance_of_playing_next_round}%)")
-            score += 30 + (75 - p.chance_of_playing_next_round)
-
-        # form trend
-        trend = _form_trend(p.recent_form_5gw)
-        if "DECLINING" in trend:
-            recent_avg = sum(p.recent_form_5gw[:2]) / 2 if len(p.recent_form_5gw) >= 2 else 0
-            flags.append(f"form {trend} (last 2 GW avg: {recent_avg:.1f}pts)")
-            score += 20
-        elif "DIPPING" in trend:
-            recent_avg = sum(p.recent_form_5gw[:2]) / 2 if len(p.recent_form_5gw) >= 2 else 0
-            flags.append(f"form {trend} (last 2 GW avg: {recent_avg:.1f}pts)")
-            score += 10
-
-        # ep_next (non-GKP)
-        try:
-            ep = float(p.ep_next)
-        except (TypeError, ValueError):
-            ep = 0.0
-        if p.position != "GKP":
-            if ep < 3.0:
-                flags.append(f"low ep_next ({p.ep_next})")
-                score += 15
-            elif ep < 4.5:
-                score += 5  # below average, soft flag
-
-        # upcoming fixtures
-        if p.fixtures_next_3:
-            avg_fdr = sum(f.fdr for f in p.fixtures_next_3) / len(p.fixtures_next_3)
-            if avg_fdr >= 4.0:
-                flags.append(f"very tough fixtures (avg FDR {avg_fdr:.1f})")
-                score += 15
-            elif avg_fdr >= 3.3:
-                flags.append(f"tough fixtures (avg FDR {avg_fdr:.1f})")
-                score += 8
-            score += avg_fdr  # tiebreaker
-
+def _sell_candidates_str(sell_reports: list[ranking.SellReport]) -> str:
+    if not sell_reports:
+        return "Squad data unavailable."
+    lines = []
+    for r in sell_reports[:4]:
+        p = r.player
         form_str = "→".join(str(x) for x in p.recent_form_5gw) if p.recent_form_5gw else "N/A"
         fix_str = _fixture_summary(p.fixtures_next_3)
-        flag_str = ", ".join(flags) if flags else "no acute flags (included as relative weakest)"
-        scored.append((score, (
-            f"- [{p.position}] {p.web_name} ({p.team_name}) £{p.now_cost}m\n"
-            f"  Last 5 GWs: {form_str} | Trend: {trend} | ep_next: {p.ep_next}\n"
+        flag_str = ", ".join(r.flags) if r.flags else "no acute flags (relative weakest)"
+        lines.append(
+            f"- [{p.position}] {p.web_name} ({p.team_name}) £{p.now_cost}m | urgency {r.score:.1f}\n"
+            f"  Last 5 GWs: {form_str} | Trend: {r.trend} | ep_next: {p.ep_next}\n"
+            f"  Underlying: xG {p.xg:.1f}, xA {p.xa:.1f}, xGI/90 {p.xgi_per_90:.2f} | "
+            f"Starts {p.starts_pct:.0f}% | YC {p.yellow_cards}\n"
             f"  Next 3 fixtures: {fix_str}\n"
             f"  Sell flags: {flag_str}"
-        )))
-
-    # sort by urgency, always surface top 4
-    scored.sort(key=lambda x: x[0], reverse=True)
-    top = scored[:4]
-    return "\n".join(entry for _, entry in top) if top else "Squad data unavailable."
+        )
+    return "\n".join(lines)
 
 
 def format_squad_for_prompt(squad: list[SquadPick]) -> str:
@@ -121,7 +71,7 @@ def format_squad_for_prompt(squad: list[SquadPick]) -> str:
         fix_str = _fixture_summary(p.fixtures_next_3)
         form_list = p.recent_form_5gw or []
         form_str = "→".join(str(pts) for pts in form_list) if form_list else "N/A"
-        trend = _form_trend(form_list)
+        trend = ranking.form_trend(form_list)
         line = (
             f"[{p.position}] {p.web_name} ({p.team_name}) £{p.now_cost}m{role}\n"
             f"      Season: {p.total_points}pts, PPG:{p.points_per_game}, "
@@ -145,25 +95,52 @@ def _injury_summary(injury_flags: list[PlayerSummary]) -> str:
     return "\n".join(parts)
 
 
-def fetch_player_context(player_names: list[str]) -> str:
+def _format_grounded_targets(
+    grounded_targets: dict[str, list[PlayerSummary]],
+    sell_by_name: dict[str, PlayerSummary],
+    gw: int,
+) -> str:
+    if not grounded_targets:
+        return ""
+    lines = ["VERIFIED TRANSFER TARGETS (FPL API + ranking — pick ONLY from these lists):"]
+    for sell_name, targets in grounded_targets.items():
+        lines.append(f"\n  If selling {sell_name}:")
+        sold = sell_by_name.get(sell_name)
+        for t in targets[:6]:
+            report = ranking.score_buy_report(t, sold, gw) if sold else None
+            fix_str = _fixture_summary(t.fixtures_next_3)
+            form_str = "→".join(str(x) for x in t.recent_form_5gw) if t.recent_form_5gw else "N/A"
+            flag_str = ", ".join(report.flags) if (report and report.flags) else ""
+            lines.append(
+                f"    • {t.web_name} ({t.team_name}) £{t.now_cost}m | score {report.score:.1f} | "
+                f"ep_next:{t.ep_next} | form:{t.form} | 5GW:{form_str}\n"
+                f"      xGI/90 {t.xgi_per_90:.2f} | Starts {t.starts_pct:.0f}% | "
+                f"{'PEN1' if t.penalties_order == 1 else ''}"
+                f"{' DFK' + str(t.direct_freekicks_order) if t.direct_freekicks_order and t.direct_freekicks_order <= 2 else ''}"
+                f"\n      Fixtures: {fix_str}"
+                + (f"\n      Flags: {flag_str}" if flag_str else "")
+            )
+    return "\n".join(lines)
+
+
+# ─────────────────────── Web search (opt-in) ───────────────────────
+
+def fetch_player_context(player_names: list[str], enabled: bool = False) -> str:
     """
-    Live web search for external context on sell candidates:
-    press conferences, European fixtures, international impacts, rotation risk.
-    Uses gpt-4o-search-preview for real-time information.
+    Gated behind `enabled` — default OFF. Expensive and flaky.
+    Enable only on explicit deep-analysis requests.
     """
-    if not player_names:
+    if not enabled or not player_names:
         return ""
     names = ", ".join(player_names[:6])
     query = (
-        f"Premier League 2024-25 season — for these players: {names}.\n"
-        f"Search for and summarise (be factual, cite only current-season news):\n"
-        f"1. Manager press conference quotes about fitness, availability, or rotation risk\n"
-        f"2. Upcoming Champions League / Europa League / Conference League fixtures "
-        f"in the next 10-14 days and whether these players are expected to start\n"
-        f"3. International break call-ups or travel fatigue concerns\n"
-        f"4. Any suspension risks (yellow card accumulation)\n"
-        f"5. Any other real-world context an FPL manager should know\n"
-        f"Keep total response under 300 words. If nothing found for a player, skip them."
+        f"Premier League current season — for these players: {names}.\n"
+        "Search for and summarise (factual, current-season only, under 250 words):\n"
+        "1. Manager press conference quotes on fitness/availability/rotation.\n"
+        "2. Upcoming European fixtures in the next 10-14 days and expected starters.\n"
+        "3. International call-up fatigue concerns.\n"
+        "4. Yellow-card suspension risk.\n"
+        "Skip players with nothing noteworthy."
     )
     try:
         resp = _get_client().chat.completions.create(
@@ -173,32 +150,10 @@ def fetch_player_context(player_names: list[str]) -> str:
         )
         return resp.choices[0].message.content.strip()
     except Exception:
-        # fall back to GPT-4o knowledge if search model unavailable
-        try:
-            resp = _get_client().chat.completions.create(
-                model="gpt-4o",
-                temperature=0.1,
-                max_tokens=400,
-                messages=[{
-                    "role": "system",
-                    "content": "You are an FPL analyst with up-to-date Premier League knowledge.",
-                }, {
-                    "role": "user",
-                    "content": (
-                        f"For these Premier League players: {names}\n"
-                        f"Based on your knowledge, briefly note (max 200 words total):\n"
-                        f"- Any known European fixture congestion in the near term\n"
-                        f"- Rotation risk based on squad depth and manager tendencies\n"
-                        f"- Any suspension risk from yellow card accumulation\n"
-                        f"- Any known fitness concerns beyond FPL's official data\n"
-                        f"Be honest about uncertainty. Skip players you have nothing useful to add."
-                    ),
-                }],
-            )
-            return resp.choices[0].message.content.strip()
-        except Exception:
-            return ""
+        return ""
 
+
+# ─────────────────────── Vibe check (unchanged) ───────────────────────
 
 def generate_vibe_check(
     manager: ManagerInfo,
@@ -217,7 +172,7 @@ def generate_vibe_check(
         f"Current Gameweek: {manager.current_gameweek}\n\n"
         f"SQUAD (fixtures include FDR 1=easy to 5=hardest):\n{format_squad_for_prompt(squad)}\n\n"
         f"INJURY CONCERNS:\n{_injury_summary(injury_flags)}\n\n"
-        "Give this manager a honest 'Vibe Check' of their squad. Comment on: "
+        "Give this manager an honest 'Vibe Check' of their squad. Comment on: "
         "overall squad quality, captain choice, fixture difficulty for key assets, injury situation. "
         "End with one punchy verdict sentence."
     )
@@ -233,35 +188,105 @@ def generate_vibe_check(
         return _FALLBACK
 
 
-def _format_grounded_targets(grounded_targets: dict[str, list[PlayerSummary]]) -> str:
+# ─────────────────────── Validators ───────────────────────
+
+def _strip_club_annotation(name: str) -> str:
+    """Strip trailing '(Club)' if LLM appended it."""
+    n = name.strip()
+    idx = n.rfind(" (")
+    if idx > 0 and n.endswith(")"):
+        return n[:idx].strip()
+    return n
+
+
+def _normalize_key(name: str) -> str:
+    """Strip initial-dot prefix (e.g. 'F.Kadıoğlu' → 'kadıoğlu')."""
+    n = name.lower().strip()
+    if "." in n:
+        parts = n.split(".", 1)
+        if len(parts[0]) <= 3:  # likely an initial
+            n = parts[1].strip()
+    return n
+
+
+def _resolve_name(
+    name: str,
+    index: dict[str, PlayerSummary],
+) -> PlayerSummary | None:
+    """Exact match → initial-stripped match → substring match (last resort)."""
+    stripped = _strip_club_annotation(name).lower()
+    if stripped in index:
+        return index[stripped]
+    norm = _normalize_key(stripped)
+    for k, v in index.items():
+        if _normalize_key(k) == norm:
+            return v
+    # substring as final fallback — require target to be >= 4 chars
+    if len(norm) >= 4:
+        candidates = [v for k, v in index.items() if norm in _normalize_key(k)]
+        if len(candidates) == 1:
+            return candidates[0]
+    return None
+
+
+def _validate_transfer(
+    t: dict,
+    player_index: dict[str, PlayerSummary],
+    squad_by_name: dict[str, PlayerSummary],
+    sell_by_name: dict[str, PlayerSummary],
+    grounded_by_sell: dict[str, list[PlayerSummary]],
+    budget_itb: float,
+    recently_sold_names: set[str],
+) -> PlayerSummary | None:
     """
-    Format verified replacement options per sell candidate.
-    GPT must pick from these — no invented names allowed.
+    Returns the verified buy-player if transfer passes all constraints, else None.
     """
-    if not grounded_targets:
-        return ""
-    lines = ["VERIFIED TRANSFER TARGETS (FPL API data — pick ONLY from these lists):"]
-    for sell_name, targets in grounded_targets.items():
-        lines.append(f"\n  If selling {sell_name}:")
-        for t in targets:
-            fix_str = _fixture_summary(t.fixtures_next_3)
-            lines.append(
-                f"    • {t.web_name} ({t.team_name}) £{t.now_cost}m | "
-                f"ep_next:{t.ep_next} | form:{t.form} | Fixtures: {fix_str}"
-            )
-    return "\n".join(lines)
+    out_name_raw = str(t.get("out", ""))
+    in_name_raw = str(t.get("in", ""))
+    if not out_name_raw or not in_name_raw:
+        return None
+
+    out_p = _resolve_name(out_name_raw, squad_by_name)
+    in_p = _resolve_name(in_name_raw, player_index)
+    if not out_p or not in_p:
+        print(f"[VALIDATE] missing player: out={out_name_raw} in={in_name_raw}", file=sys.stderr)
+        return None
+
+    # Must be a real sell candidate
+    if out_p.web_name not in sell_by_name:
+        print(f"[VALIDATE] {out_p.web_name} not in sell candidates", file=sys.stderr)
+        return None
+
+    # Must be in grounded targets list for that sell
+    targets = grounded_by_sell.get(out_p.web_name, [])
+    if in_p.id not in {tt.id for tt in targets}:
+        print(f"[VALIDATE] {in_p.web_name} not in grounded list for {out_p.web_name}", file=sys.stderr)
+        return None
+
+    # Same FPL position
+    if out_p.position != in_p.position:
+        print(f"[VALIDATE] position mismatch {out_p.position}→{in_p.position}", file=sys.stderr)
+        return None
+
+    # Different club
+    if out_p.team_name == in_p.team_name:
+        print(f"[VALIDATE] same club", file=sys.stderr)
+        return None
+
+    # Budget
+    if in_p.now_cost > out_p.now_cost + budget_itb + 0.01:
+        print(f"[VALIDATE] over budget: {in_p.now_cost} > {out_p.now_cost + budget_itb}", file=sys.stderr)
+        return None
+
+    # Recently sold exclusion
+    if in_p.web_name.lower() in recently_sold_names:
+        print(f"[VALIDATE] {in_name} recently sold, refusing flip-flop", file=sys.stderr)
+        return None
+
+    return in_p
 
 
-def _build_player_index(squad: list[SquadPick], grounded_targets: dict[str, list[PlayerSummary]]) -> dict[str, PlayerSummary]:
-    """Name → PlayerSummary index for post-generation validation."""
-    index: dict[str, PlayerSummary] = {}
-    for pick in squad:
-        index[pick.player.web_name.lower()] = pick.player
-    for targets in grounded_targets.values():
-        for t in targets:
-            index[t.web_name.lower()] = t
-    return index
-
+# ─────────────────────── Main brief generation ───────────────────────
 
 def generate_pre_deadline_brief(
     manager: ManagerInfo,
@@ -274,84 +299,88 @@ def generate_pre_deadline_brief(
     budget: BudgetInfo,
     league_standings: list[LeagueStanding],
     grounded_targets: dict[str, list[PlayerSummary]] | None = None,
+    sell_reports: list[ranking.SellReport] | None = None,
+    active_chip: str | None = None,
+    past_outcomes: list[TransferOutcome] | None = None,
+    enable_web_search: bool = False,
 ) -> tuple[str, list[TransferRecommendation]]:
 
     if grounded_targets is None:
         grounded_targets = {}
+    if sell_reports is None:
+        sell_reports = []
 
-    player_index = _build_player_index(squad, grounded_targets)
+    gw = manager.current_gameweek
+    phase = ranking.season_phase(gw)
+    sell_by_name = {r.player.web_name: r.player for r in sell_reports}
+    squad_by_name = {p.player.web_name.lower(): p.player for p in squad}
+    player_index = dict(squad_by_name)
+    for targets in grounded_targets.values():
+        for t in targets:
+            player_index[t.web_name.lower()] = t
 
-    # --- pre-compute sell candidates & fetch live context ---
-    sell_candidates_str = _sell_candidates(squad)
+    # Recently-sold set for flip-flop exclusion (lookback 3 GWs)
+    recent_sold_ids = ranking.recently_sold_ids(transfer_history, gw, lookback=3)
+    # Need names too — look up via any target or squad
+    recent_sold_names = set()
+    for _id in recent_sold_ids:
+        for p in list(player_index.values()):
+            if p.id == _id:
+                recent_sold_names.add(p.web_name.lower())
 
-    # extract names of top sell candidates for external context search
-    # always include top 3 from sell candidates (not just injured/bad form)
-    sell_names = []
-    scored_for_context = []
-    for pick in squad:
-        if pick.position > 11:
-            continue
-        p = pick.player
-        trend = _form_trend(p.recent_form_5gw)
-        is_injured = p.chance_of_playing_next_round is not None and p.chance_of_playing_next_round < 75
-        is_bad_form = "DECLINING" in trend or "DIPPING" in trend
-        priority = (2 if is_injured else 0) + (1 if is_bad_form else 0)
-        scored_for_context.append((priority, p.web_name))
-    scored_for_context.sort(key=lambda x: x[0], reverse=True)
-    # only fetch external context if there are genuinely flagged players (saves search-preview cost)
-    flagged_names = [name for priority, name in scored_for_context if priority > 0]
-    sell_names = flagged_names[:4] if flagged_names else []
+    # Feedback loop
+    feedback = ranking.past_outcome_adjustment(past_outcomes or [])
 
-    external_context = fetch_player_context(sell_names) if sell_names else ""
+    # External context (gated)
+    sell_names_for_context = []
+    for r in sell_reports[:4]:
+        if any("injury" in f or "suspension" in f for f in r.flags):
+            sell_names_for_context.append(r.player.web_name)
+    external_context = fetch_player_context(sell_names_for_context, enabled=enable_web_search)
+
+    # Build strings for prompt
+    sell_candidates_str = _sell_candidates_str(sell_reports)
+    grounded_str = _format_grounded_targets(grounded_targets, sell_by_name, gw)
+
+    # Chip-aware transfer count target
+    chip_note = ""
+    max_transfers = 3
+    if active_chip == "wildcard":
+        chip_note = "WILDCARD IS ACTIVE — no hit cost for any transfers. Suggest 3-5 high-impact moves."
+        max_transfers = 5
+    elif active_chip == "freehit":
+        chip_note = "FREE HIT IS ACTIVE — transfers reset after this GW. Maximize ep_next for this GW only; ignore long-term fixture ticker."
+        max_transfers = 5
+    elif active_chip in ("bboost", "3xc"):
+        chip_note = f"{active_chip.upper()} CHIP ACTIVE — standard transfer rules but emphasize premium upside."
 
     system = (
         "You are a precision FPL (Fantasy Premier League) transfer analyst.\n\n"
-
-        "DATA AVAILABLE:\n"
-        "- ep_next: FPL's ML model prediction for next GW points\n"
-        "- Last 5 GW scores (newest→oldest) with trend label\n"
-        "- Next 3 fixture FDRs with avg difficulty rating for both outgoing AND incoming players\n"
-        "- Player price, ownership %, PPG\n"
-        "- Live external context: press conferences, European fixtures, suspension risk\n\n"
-
-        "TRANSFER RULES — FOLLOW STRICTLY:\n"
-        "1. Only sell players listed in SELL CANDIDATES.\n"
-        "2. ONLY suggest transfer-in players from the VERIFIED TRANSFER TARGETS list. "
-        "Never invent a player name not on the list.\n"
-        "3. NEVER suggest a replacement from the SAME CLUB as the player being sold.\n"
-        "4. MATCH POSITION SUB-TYPE using football knowledge: selling an RB → target RB/WB, "
-        "not a CB. Selling a striker → target striker. Use real positional knowledge within FPL's "
-        "GKP/DEF/MID/FWD groupings.\n"
-        "5. BUDGET: incoming price ≤ (sell price + ITB). All targets in the list are pre-filtered "
-        "as affordable — just pick the best.\n"
-        "6. For sell_reasoning: cite last 5 GW scores, form trend, ep_next, AND all 3 upcoming "
-        "fixture FDRs. If external context applies, reference it.\n"
-        "7. For buy_reasoning: cite form trend, ep_next, all 3 upcoming FDRs, DGW exposure, "
-        "ownership differential. Reference external context if relevant.\n"
-        "8. For external_context field: include any press conference quotes, European fixture "
-        "congestion, suspension risk, or other real-world context relevant to THIS specific transfer. "
-        "Leave empty string if nothing applicable.\n"
-        "9. Confidence — High: form ↑ + fixtures easy + ep_next strong. Medium: 2 signals. Low: 1.\n\n"
-
-        "FREE TRANSFER RULE:\n"
-        "- ALWAYS return 1–3 transfer suggestions regardless of how many free transfers the manager has.\n"
-        "- If free_transfers = 0, each suggestion's signals array MUST include '4pt hit required' and "
-        "the budget_check MUST end with '(4pt hit)'. The narrative should acknowledge the hit cost "
-        "but still recommend the move if the data justifies it.\n"
-        "- NEVER use zero free transfers as a reason to return an empty transfers array.\n\n"
-
-        "OUTPUT: Return ONLY valid JSON with keys 'narrative' and 'transfers'.\n"
-        "'narrative': 2–3 sentence overview of the squad situation (deadline urgency, "
-        "key risks, league context). DO NOT name specific transfer-in targets or give "
-        "transfer advice here — that belongs exclusively in the 'transfers' array.\n"
-        "'transfers': array of EXACTLY 1–3 objects. This array MUST NOT be empty. "
-        "Each object has EXACTLY these keys:\n"
-        "  out, out_club, out_price, in, in_club, in_price,\n"
-        "  sell_reasoning, buy_reasoning, budget_check, confidence, signals, external_context\n"
-        "sell_reasoning / buy_reasoning: 2 sentences each, data-specific.\n"
-        "budget_check: 'Sell price £Xm + £Ym ITB = £Zm available. Target £Wm. Net: ±£Vm'\n"
-        "signals: 3–5 short strings (the raw data signals).\n"
-        "external_context: 1–2 sentences of real-world context, or empty string.\n"
+        f"SEASON PHASE: {phase} (GW{gw}).\n"
+        f"{chip_note}\n\n"
+        "DATA PROVIDED:\n"
+        "- Sell candidates with urgency score, flags, form trend, xG/xA, set-pieces.\n"
+        "- Grounded buy targets with composite score, trend, directional FDR.\n"
+        "- Directional FDR (dFDR) accounts for team attack/defence strength.\n\n"
+        "RULES (STRICT):\n"
+        "1. Only sell players from SELL CANDIDATES.\n"
+        "2. Only buy from the VERIFIED TRANSFER TARGETS list for each sell.\n"
+        "3. Never same club. Never same player. Match FPL position.\n"
+        "4. Budget arithmetic will be checked by validator — do not invent numbers.\n"
+        "5. For sell_reasoning: cite urgency flags + last 5 GWs + trend + directional FDR.\n"
+        "6. For buy_reasoning: cite composite score flags + xGI/90 + set-piece role + directional FDR.\n"
+        "7. External_context field: only if external context section is present.\n"
+        "8. If free_transfers == 0, EACH transfer object's signals[] MUST include "
+        "'4pt hit required'. Recommend only when projected gain justifies it.\n"
+        "9. ALWAYS return 1–" + str(max_transfers) + " transfers unless squad is flawless. "
+        "NEVER return empty transfers.\n\n"
+        "OUTPUT: JSON with keys 'narrative' and 'transfers'.\n"
+        "'narrative': 2–3 sentences on squad situation. DO NOT name transfer targets here.\n"
+        "'transfers': array of 1–" + str(max_transfers) + " objects. Each has keys:\n"
+        "  out, in, sell_reasoning, buy_reasoning, signals, external_context\n"
+        "  'out' and 'in' MUST be the player's web_name ONLY (e.g. 'Saka', not 'Saka (Arsenal)').\n"
+        "Signals array: 3-5 short strings. External_context: 1-2 sentences or empty string.\n"
+        "confidence, budget_check, and clubs/prices will be filled by validator — do not set them.\n"
     )
 
     dgw_str = "\n".join(f"- {p.web_name} ({p.team_name})" for p in dgw_players) or "None"
@@ -360,6 +389,7 @@ def generate_pre_deadline_brief(
         "\n".join(f"- {l.name}: Rank {l.rank:,} / {l.total_managers:,}" for l in league_standings)
         or "No mini-league data"
     )
+    outcome_str = feedback.get("caveat", "") or "No recent track record adjustment."
 
     user = (
         f"Deadline: {deadline_str}\n"
@@ -367,31 +397,25 @@ def generate_pre_deadline_brief(
 
         f"BUDGET:\n"
         f"- In the bank: £{budget.itb}m\n"
-        f"- Free transfers available: {budget.free_transfers} "
-        f"{'(any further transfer = 4pt hit)' if budget.free_transfers == 0 else '(additional transfers cost 4pts each)'}\n"
-        f"- Transfers made this GW: {budget.transfers_made}"
-        f"{f' (hit already taken: -{budget.hit_cost}pts)' if budget.hit_cost > 0 else ''}\n\n"
+        f"- Free transfers available: {budget.free_transfers}\n"
+        f"- Transfers made this GW: {budget.transfers_made}\n"
+        f"- Active chip: {active_chip or 'none'}\n\n"
 
-        f"SELL CANDIDATES (starting XI only):\n{sell_candidates_str}\n\n"
+        f"SELL CANDIDATES (ranked by urgency):\n{sell_candidates_str}\n\n"
 
-        + (_format_grounded_targets(grounded_targets) + "\n\n" if grounded_targets else "")
+        + (grounded_str + "\n\n" if grounded_str else "")
 
-        + (f"EXTERNAL CONTEXT (press conferences, European fixtures, suspensions):\n{external_context}\n\n"
-           if external_context else "") +
+        + (f"EXTERNAL CONTEXT:\n{external_context}\n\n" if external_context else "") +
 
         f"FULL SQUAD:\n{format_squad_for_prompt(squad)}\n\n"
-
         f"INJURY FLAGS:\n{_injury_summary(injury_flags)}\n\n"
-
         f"DOUBLE GW ASSETS:\n{dgw_str}\n\n"
         f"BLANK GW CONCERNS:\n{bgw_str}\n\n"
-
         f"MINI-LEAGUE:\n{league_str}\n\n"
+        f"PAST TRACK RECORD:\n{outcome_str}\n\n"
 
-        "Produce the JSON response now. The 'transfers' array MUST contain 1–3 fully populated "
-        "objects. Pick sell targets from SELL CANDIDATES, match position sub-type, verify budget "
-        "arithmetic, reference all 3 fixture FDRs in your reasoning, and incorporate any relevant "
-        "external context. Do NOT put transfer player names or advice in 'narrative'."
+        "Produce the JSON response now. Return 1–" + str(max_transfers) + " transfers with "
+        "sell_reasoning and buy_reasoning each 2 sentences. Do NOT put transfer advice in narrative."
     )
 
     try:
@@ -403,60 +427,87 @@ def generate_pre_deadline_brief(
             response_format={"type": "json_object"},
         )
         raw_content = resp.choices[0].message.content
-        import sys
         print(f"[LLM DEBUG] raw JSON:\n{raw_content[:2000]}", file=sys.stderr)
         data = json.loads(raw_content)
         narrative = data.get("narrative", _FALLBACK)
+        if feedback.get("caveat"):
+            narrative = f"{narrative} {feedback['caveat']}"
         raw_transfers = data.get("transfers", [])
         if not isinstance(raw_transfers, list):
             raw_transfers = []
-
-        def _fmt_price(v) -> str:
-            if isinstance(v, (int, float)):
-                return f"£{v:.1f}m"
-            s = str(v).strip() if v else ""
-            if s and not s.startswith("£"):
-                s = f"£{s}"
-            return s
-
-        def _ground(name: str, field_club: str, field_price: str) -> tuple[str, str]:
-            """Look up verified club and price from our API data."""
-            p = player_index.get(name.lower())
-            if p:
-                return p.team_name, f"£{p.now_cost}m"
-            return field_club, field_price
-
-        transfers: list[TransferRecommendation] = []
-        for t in raw_transfers[:3]:
-            if not isinstance(t, dict):
-                continue
-            try:
-                out_name = str(t.get("out", ""))
-                in_name  = str(t.get("in", ""))
-
-                # Validate / overwrite with API truth
-                out_club, out_price = _ground(out_name, str(t.get("out_club", "")), _fmt_price(t.get("out_price", "")))
-                in_club,  in_price  = _ground(in_name,  str(t.get("in_club", "")),  _fmt_price(t.get("in_price", "")))
-
-                transfers.append(TransferRecommendation(
-                    out=out_name,
-                    out_club=out_club,
-                    out_price=out_price,
-                    in_=in_name,
-                    in_club=in_club,
-                    in_price=in_price,
-                    sell_reasoning=str(t.get("sell_reasoning", "")),
-                    buy_reasoning=str(t.get("buy_reasoning", "")),
-                    budget_check=str(t.get("budget_check", "")),
-                    confidence=str(t.get("confidence", "Medium")),
-                    signals=[str(s) for s in t.get("signals", [])],
-                    external_context=str(t.get("external_context", "")),
-                ))
-            except Exception as e:
-                import sys
-                print(f"[LLM DEBUG] transfer parse error: {e} | raw: {t}", file=sys.stderr)
-                continue
-
-        return narrative, transfers
-    except (APIError, RateLimitError, json.JSONDecodeError, KeyError):
+    except (APIError, RateLimitError, json.JSONDecodeError, KeyError) as e:
+        print(f"[LLM DEBUG] generation failed: {e}", file=sys.stderr)
         return _FALLBACK, []
+
+    # ── Post-hoc validation + deterministic fields ────────────────────────────
+    transfers: list[TransferRecommendation] = []
+    green_threshold_high = 5 if feedback.get("tighten_confidence") else 4
+    green_threshold_med = 3 if feedback.get("tighten_confidence") else 2
+
+    for t in raw_transfers[: max_transfers]:
+        if not isinstance(t, dict):
+            continue
+        in_p = _validate_transfer(
+            t, player_index, squad_by_name, sell_by_name, grounded_targets,
+            budget.itb, recent_sold_names,
+        )
+        if in_p is None:
+            continue
+
+        out_p = _resolve_name(str(t.get("out", "")), squad_by_name)
+        if out_p is None:
+            continue
+
+        sell_report = next((r for r in sell_reports if r.player.id == out_p.id), None)
+        buy_report = ranking.score_buy_report(in_p, out_p, gw)
+
+        # Hit breakeven gate
+        hit_required = budget.free_transfers == 0
+        if hit_required and sell_report:
+            if not ranking.hit_breakeven_ok(buy_report, sell_report):
+                print(f"[VALIDATE] hit not profitable: {out_name}→{in_p.web_name}", file=sys.stderr)
+                continue
+
+        # Build signals (merge LLM-provided with deterministic)
+        llm_signals = [str(s) for s in t.get("signals", []) if s]
+        merged_signals = list(dict.fromkeys(llm_signals + buy_report.signals))
+        if hit_required and not any("4pt hit" in s.lower() for s in merged_signals):
+            merged_signals.append("4pt hit required")
+
+        # Deterministic confidence from positive flag count
+        green_count = len(buy_report.flags)
+        # Penalize if sell urgency was low (weak case to sell in first place)
+        if sell_report and sell_report.score < 8:
+            green_count = max(0, green_count - 1)
+        if green_count >= green_threshold_high:
+            confidence = "High"
+        elif green_count >= green_threshold_med:
+            confidence = "Medium"
+        else:
+            confidence = "Low"
+
+        # Deterministic budget_check
+        net = round((out_p.now_cost + budget.itb) - in_p.now_cost, 1)
+        budget_check = (
+            f"Sell £{out_p.now_cost}m + £{budget.itb}m ITB = "
+            f"£{round(out_p.now_cost + budget.itb, 1)}m available. "
+            f"Target £{in_p.now_cost}m. Net: {'+' if net >= 0 else ''}£{net}m"
+            + (" (4pt hit)" if hit_required else "")
+        )
+
+        transfers.append(TransferRecommendation(
+            out=out_p.web_name,
+            out_club=out_p.team_name,
+            out_price=f"£{out_p.now_cost}m",
+            in_=in_p.web_name,
+            in_club=in_p.team_name,
+            in_price=f"£{in_p.now_cost}m",
+            sell_reasoning=str(t.get("sell_reasoning", "")),
+            buy_reasoning=str(t.get("buy_reasoning", "")),
+            budget_check=budget_check,
+            confidence=confidence,
+            signals=merged_signals[:6],
+            external_context=str(t.get("external_context", "")),
+        ))
+
+    return narrative, transfers
