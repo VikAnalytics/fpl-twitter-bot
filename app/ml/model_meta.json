@@ -1,0 +1,21 @@
+{
+  "feature_names": [
+    "form",
+    "team_ppg",
+    "team_gd_pg",
+    "opponent_strength",
+    "last_season_pts_per90",
+    "chance_of_playing",
+    "xgi_per_90",
+    "xgc_per_90",
+    "avg_fdr",
+    "starts_pct",
+    "ep_next"
+  ],
+  "holdout_mae": 0.640952106887428,
+  "training_rows": 25293,
+  "holdout_rows": 4464,
+  "seasons": [
+    "2025-26"
+  ]
+}

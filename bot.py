@@ -5,6 +5,7 @@ import datetime
 from collections import Counter
 import tweepy
 
+from app import database as db
 from app.database import init_db, get_full_bot_state, set_full_bot_state
 
 init_db()
@@ -69,6 +70,10 @@ def _trim(seq: list, keep: int = 10) -> list:
     """Trim bot-state id lists so they don't grow forever."""
     return seq[-keep:] if len(seq) > keep else seq
 
+RESYNC_GAP_HOURS = 6  # dormant longer than this -> treat the next run as a
+# silent resync instead of tweeting the whole accumulated backlog as "news"
+
+
 def main():
     # --- FETCH FPL DATA ---
 
@@ -96,13 +101,30 @@ def main():
         "injuries": _stored.get("injuries", {}),
         "deadline_alert": _stored.get("deadline_alert", []),
         "top_players": _stored.get("top_players", []),
+        "last_run_at": _stored.get("last_run_at"),
     }
-        
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+
+    # --- 0. DETECT LONG DORMANCY (silent resync — no backlog-of-tweets flood) ---
+    # If the bot hasn't run in a while (or ever), the injury diff below would
+    # otherwise treat every change accumulated during the gap as "breaking
+    # news" and fire a tweet for each one — exactly what happened after a
+    # 3-month dormancy. Resync runs still update state so the NEXT run's
+    # diff is accurate; they just don't tweet the injury/recovery backlog.
+    is_resync = True
+    if state["last_run_at"]:
+        try:
+            last_run_dt = datetime.datetime.fromisoformat(state["last_run_at"])
+            is_resync = (now_utc - last_run_dt) > datetime.timedelta(hours=RESYNC_GAP_HOURS)
+        except ValueError:
+            is_resync = True
+    if is_resync:
+        print(f"Resync run (dormant >{RESYNC_GAP_HOURS}h or first run ever) — updating injury state silently, no backlog tweets.")
+
 # --- 1. CHECK 12-HOUR DEADLINE ---
     deadline = datetime.datetime.strptime(
         next_event['deadline_time'], "%Y-%m-%dT%H:%M:%SZ"
     ).replace(tzinfo=datetime.timezone.utc)
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
     time_diff = deadline - now_utc
 
     # Triggers the first time the bot wakes up and the deadline is under 12 hours away.
@@ -194,10 +216,12 @@ def main():
 
     old_injuries = state.get("injuries", {})
 
-    # New / worsened / changed injuries
+    # New / worsened / changed injuries. Diffs are still computed on a resync
+    # run (so state stays accurate) — only the tweeting is skipped, to avoid
+    # firing one tweet per player for a whole dormancy gap's worth of changes.
     for pid, info in current_injuries.items():
         prev_status = old_injuries.get(pid, {}).get('status')
-        if prev_status != info['status']:
+        if prev_status != info['status'] and not is_resync:
             # Severity icon: 0% out, ≤50% doubtful, >50% likely
             if info['status'] == 0:
                 sev = "🔴 RULED OUT"
@@ -224,7 +248,7 @@ def main():
         if not p:
             continue
         chance = p.get('chance_of_playing_next_round')
-        if chance == 100 or chance is None:
+        if (chance == 100 or chance is None) and not is_resync:
             club = team_short.get(p['team'], "")
             pos = position_map.get(p['element_type'], "")
             send_tweet(_fit_tweet(
@@ -297,10 +321,14 @@ def main():
                 state.setdefault('top_players', []).append(prev_event['id'])
 
     state['injuries'] = current_injuries
+    state['last_run_at'] = now_utc.isoformat()
     for k in ('dgw', 'bgw', 'deadline_alert', 'top_players'):
         if isinstance(state.get(k), list):
             state[k] = _trim(state[k])
     set_full_bot_state(state)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        db.close()  # Turso client runs a background thread that otherwise hangs the process

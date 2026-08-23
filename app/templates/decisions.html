@@ -1,0 +1,132 @@
+{% extends "base.html" %}
+{% block title %}Agent Decisions — Manager {{ manager_id }}{% endblock %}
+
+{% block extra_styles %}
+<style>
+  .decision-card { animation: fadeUp 0.35s ease both; }
+  .decision-hdr { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+  .decision-title { font-family: var(--font-display); font-size: 1.1rem; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase; }
+  .decision-meta { font-family: var(--font-mono); font-size: 0.55rem; color: var(--text-muted); letter-spacing: 0.1em; }
+
+  .transcript { border-top: 1px solid var(--border); margin-top: 14px; padding-top: 14px; }
+  .turn { padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.03); }
+  .turn:last-child { border-bottom: none; }
+  .turn-hdr { font-family: var(--font-mono); font-size: 0.55rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--blue); margin-bottom: 4px; }
+  .turn-hdr .rnd { color: var(--text-muted); margin-left: 8px; }
+  .turn-msg { font-family: var(--font-body); font-size: 0.85rem; line-height: 1.5; color: var(--text); }
+
+  .candidates-table { margin-top: 12px; }
+  .actions { display: flex; gap: 10px; margin-top: 16px; }
+  .btn { font-family: var(--font-mono); font-size: 0.6rem; letter-spacing: 0.1em; text-transform: uppercase; padding: 8px 18px; border: 1px solid var(--border); cursor: pointer; background: transparent; color: var(--text); transition: all var(--transition); }
+  .btn-approve { border-color: var(--emerald); color: var(--emerald); }
+  .btn-approve:hover { background: var(--emerald-dim); }
+  .btn-reject { border-color: var(--rose); color: var(--rose); }
+  .btn-reject:hover { background: var(--rose-dim); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  details > summary { cursor: pointer; font-family: var(--font-mono); font-size: 0.57rem; letter-spacing: 0.14em; text-transform: uppercase; color: var(--text-dim); }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="page-hdr" style="margin-bottom: 32px;">
+  <div class="card-label">// Agent Decision Log — Manager {{ manager_id }}</div>
+  <h1 style="font-family: var(--font-display); font-size: clamp(1.8rem, 4vw, 2.8rem); text-transform: uppercase;">Decisions &amp; Debates</h1>
+</div>
+
+{% if not decisions %}
+  <div class="card"><p style="color: var(--text-muted);">No decisions logged yet.</p></div>
+{% endif %}
+
+{% for d in decisions %}
+<div class="card decision-card {{ 'blue-edge' if d.decision_type == 'transfer' else 'amber-edge' }}" id="decision-{{ d.id }}">
+  <div class="decision-hdr">
+    <div>
+      <span class="decision-title">{{ d.decision_type|upper }} — GW{{ d.gameweek }}</span>
+    </div>
+    <div style="display:flex; gap:8px; align-items:center;">
+      <span class="badge {{ 'badge-emerald' if d.confidence == 'High' else ('badge-amber' if d.confidence == 'Medium' else 'badge-dim') }}">{{ d.confidence }} confidence</span>
+      <span class="badge {% if d.status == 'executed' %}badge-emerald{% elif d.status == 'failed' %}badge-rose{% elif d.status == 'pending_approval' %}badge-orange{% else %}badge-dim{% endif %}">{{ d.status }}</span>
+    </div>
+  </div>
+  <div class="decision-meta">Decision #{{ d.id }} · created {{ d.created_at }}</div>
+
+  {% if d.decision_type == 'transfer' %}
+    {% if d.proposal.transfers %}
+      <div style="margin-top:12px;">
+        {% for t in d.proposal.transfers %}
+          <div style="font-family: var(--font-body); font-size: 0.9rem; margin-bottom: 4px;">
+            <strong>{{ t.out }}</strong> → <strong style="color: var(--blue);">{{ t.in }}</strong>
+            <span style="color: var(--text-muted); font-size: 0.8rem;"> — {{ t.rationale }}</span>
+          </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <p style="color: var(--text-muted); margin-top: 12px;">No transfer recommended.</p>
+    {% endif %}
+    <p style="color: var(--text-muted); font-size: 0.85rem; margin-top: 8px;">{{ d.proposal.summary }}</p>
+  {% elif d.decision_type == 'captain' %}
+    <p style="margin-top:12px;"><strong>{{ d.proposal.captain }}</strong> (vice: {{ d.proposal.vice }})</p>
+    <p style="color: var(--text-muted); font-size: 0.85rem;">{{ d.proposal.rationale }}</p>
+  {% elif d.decision_type == 'lineup' %}
+    <p style="margin-top:12px;">
+      {% for b in d.proposal.bench_order %}{{ b.order }}. {{ b.player }}&nbsp;&nbsp;{% endfor %}
+    </p>
+  {% endif %}
+
+  {% if d.status == 'pending_approval' %}
+  <div class="actions">
+    <button class="btn btn-approve" onclick="decide({{ d.id }}, 'approve', this)">Approve</button>
+    <button class="btn btn-reject" onclick="decide({{ d.id }}, 'reject', this)">Reject</button>
+  </div>
+  {% endif %}
+
+  {% if d.candidates %}
+  <details class="candidates-table">
+    <summary>Candidates considered ({{ d.candidates|length }})</summary>
+    <table class="data-table" style="margin-top:8px;">
+      <thead><tr><th>Player</th><th>Role</th><th>Source</th><th>Predicted</th><th>Actual</th></tr></thead>
+      <tbody>
+        {% for c in d.candidates %}
+        <tr>
+          <td>{{ c.player_name }}</td>
+          <td>{{ c.role }}</td>
+          <td>{{ c.source_agent }}</td>
+          <td>{{ c.predicted_points }}</td>
+          <td>{{ c.actual_points if c.actual_points is not none else '—' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </details>
+  {% endif %}
+
+  {% if d.conversation %}
+  <details class="transcript">
+    <summary>Debate transcript ({{ d.conversation|length }} turns)</summary>
+    {% for turn in d.conversation %}
+    <div class="turn">
+      <div class="turn-hdr">{{ turn.agent_name }}<span class="rnd">round {{ turn.round }}</span></div>
+      <div class="turn-msg">{{ turn.message }}</div>
+    </div>
+    {% endfor %}
+  </details>
+  {% endif %}
+</div>
+{% endfor %}
+
+<script>
+async function decide(id, action, btn) {
+  btn.disabled = true;
+  const row = btn.closest('.decision-card');
+  try {
+    const resp = await fetch(`/api/decisions/${id}/${action}`, { method: 'POST' });
+    if (!resp.ok) throw new Error(await resp.text());
+    location.reload();
+  } catch (e) {
+    alert('Failed: ' + e.message);
+    btn.disabled = false;
+  }
+}
+</script>
+{% endblock %}

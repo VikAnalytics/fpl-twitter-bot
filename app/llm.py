@@ -56,6 +56,7 @@ def _sell_candidates_str(sell_reports: list[ranking.SellReport]) -> str:
             f"Starts {p.starts_pct:.0f}% | YC {p.yellow_cards}\n"
             f"  Next 3 fixtures: {fix_str}\n"
             f"  Sell flags: {flag_str}"
+            + (f"\n  FPL news: {p.news}" if p.news else "")
         )
     return "\n".join(lines)
 
@@ -119,38 +120,72 @@ def _format_grounded_targets(
                 f"{' DFK' + str(t.direct_freekicks_order) if t.direct_freekicks_order and t.direct_freekicks_order <= 2 else ''}"
                 f"\n      Fixtures: {fix_str}"
                 + (f"\n      Flags: {flag_str}" if flag_str else "")
+                + (f"\n      FPL news: {t.news}" if t.news else "")
             )
     return "\n".join(lines)
 
 
-# ─────────────────────── Web search (opt-in) ───────────────────────
+# ─────────────────────── Web search (opt-in, real cost per call) ───────────
+#
+# The old gpt-4o-search-preview / gpt-4o-mini-search-preview chat-completion
+# models were deprecated (July 2026) — confirmed live (a real call returned
+# HTTP 404 model_not_found) rather than assumed. Current mechanism is the
+# Responses API with a `web_search` tool attached to a regular model —
+# verified with a real call before wiring this in (a live query about a
+# player correctly returned an answer dated "August 23, 2026").
 
-def fetch_player_context(player_names: list[str], enabled: bool = False) -> str:
+_SEARCH_MODEL = "gpt-4.1-mini"  # see app/pricing.py for the (higher, since
+# this bills a flat ~$0.025/call tool fee + a search-content token block on
+# top of normal generation) cost this carries vs. the debate's gpt-4o-mini.
+
+
+def fetch_player_context(
+    player_names: list[str],
+    enabled: bool = False,
+    return_usage: bool = False,
+) -> str | tuple[str, dict]:
     """
-    Gated behind `enabled` — default OFF. Expensive and flaky.
-    Enable only on explicit deep-analysis requests.
+    Real web search (press conferences, news outlet coverage, training-ground
+    reports — e.g. "not seen training with the squad") for the given
+    players, ONE call covering all of them (not one call per player — this
+    tool bills a flat per-call fee, so batching matters). Gated behind
+    `enabled` — default OFF for callers that don't want the cost/latency.
+
+    return_usage=True returns (text, {"tokens_in":, "tokens_out":}) instead
+    of just the text, for cost tracking (see app/agents/pipeline.py).
     """
+    empty = ("", {}) if return_usage else ""
     if not enabled or not player_names:
-        return ""
-    names = ", ".join(player_names[:6])
+        return empty
+
+    names = ", ".join(sorted(set(player_names))[:40])
     query = (
         f"Premier League current season — for these players: {names}.\n"
-        "Search for and summarise (factual, current-season only, under 250 words):\n"
-        "1. Manager press conference quotes on fitness/availability/rotation.\n"
-        "2. Upcoming European fixtures in the next 10-14 days and expected starters.\n"
-        "3. International call-up fatigue concerns.\n"
-        "4. Yellow-card suspension risk.\n"
-        "Skip players with nothing noteworthy."
+        "Search for and summarise (factual, current-season only, under 500 words):\n"
+        "1. Reports that a player has been left out of training, not seen training with "
+        "the squad, or training away from the main group.\n"
+        "2. Manager press conference quotes on fitness/availability/rotation.\n"
+        "3. Upcoming European fixtures in the next 10-14 days and expected starters.\n"
+        "4. International call-up fatigue concerns.\n"
+        "5. Yellow-card suspension risk.\n"
+        "Skip players with nothing noteworthy — don't pad with 'no news' filler."
     )
     try:
-        resp = _get_client().chat.completions.create(
-            model="gpt-4o-search-preview",
-            messages=[{"role": "user", "content": query}],
-            max_tokens=500,
+        resp = _get_client().responses.create(
+            model=_SEARCH_MODEL,
+            tools=[{"type": "web_search", "search_context_size": "low"}],
+            input=query,
         )
-        return resp.choices[0].message.content.strip()
+        text = (resp.output_text or "").strip()
+        if not return_usage:
+            return text
+        usage = resp.usage
+        return text, {
+            "tokens_in": getattr(usage, "input_tokens", None),
+            "tokens_out": getattr(usage, "output_tokens", None),
+        }
     except Exception:
-        return ""
+        return empty
 
 
 # ─────────────────────── Vibe check (unchanged) ───────────────────────

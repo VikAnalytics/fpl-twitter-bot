@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block title %}{% if run_id %}Run {{ run_id }}{% else %}Pipeline Runs{% endif %} — FPL Gaffer{% endblock %}
+
+{% block extra_styles %}
+<style>
+  .run-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 18px; border-bottom: 1px solid var(--border); text-decoration: none; color: var(--text); transition: background var(--transition); }
+  .run-row:hover { background: var(--bg-card-h); }
+  .run-row:last-child { border-bottom: none; }
+  .run-id { font-family: var(--font-mono); font-size: 0.8rem; color: var(--blue); }
+  .run-meta { font-family: var(--font-mono); font-size: 0.65rem; color: var(--text-muted); }
+
+  .step-card { animation: fadeUp 0.3s ease both; }
+  .step-hdr { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+  .step-stage { font-family: var(--font-mono); font-size: 0.85rem; font-weight: 600; }
+  .step-meta { font-family: var(--font-mono); font-size: 0.6rem; color: var(--text-muted); letter-spacing: 0.06em; }
+  .step-detail { background: var(--bg-inset); padding: 12px 14px; margin-top: 8px; font-family: var(--font-mono); font-size: 0.72rem; line-height: 1.6; color: var(--text); white-space: pre-wrap; word-break: break-word; max-height: 400px; overflow-y: auto; border-radius: var(--radius); }
+  details > summary { cursor: pointer; font-family: var(--font-mono); font-size: 0.6rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--text-dim); margin-top: 4px; }
+</style>
+{% endblock %}
+
+{% block content %}
+{% if steps is not none %}
+  <div class="page-hdr" style="margin-bottom: 32px;">
+    <div class="card-label">// Pipeline Trace</div>
+    <h1 style="font-family: var(--font-display); font-size: clamp(1.6rem, 4vw, 2.4rem); text-transform: uppercase;">Run {{ run_id }}</h1>
+    <p style="margin-top: 8px;"><a href="/runs" style="color: var(--blue);">&larr; All runs</a></p>
+  </div>
+
+  {% if not steps %}
+    <div class="card"><p style="color: var(--text-muted);">No steps logged for this run id.</p></div>
+  {% endif %}
+
+  {% for s in steps %}
+  <div class="card step-card {% if s.status == 'failed' %}rose-edge{% elif s.status == 'succeeded' %}green-edge{% else %}amber-edge{% endif %}">
+    <div class="step-hdr">
+      <span class="step-stage">{{ s.stage }}</span>
+      <div style="display:flex; gap:8px; align-items:center;">
+        {% if s.duration_ms is not none %}<span class="badge badge-dim">{{ s.duration_ms }}ms</span>{% endif %}
+        <span class="badge {% if s.status == 'failed' %}badge-rose{% elif s.status == 'succeeded' %}badge-emerald{% else %}badge-orange{% endif %}">{{ s.status }}</span>
+      </div>
+    </div>
+    <div class="step-meta">
+      {{ s.created_at }}
+      {% if s.gameweek %} · GW{{ s.gameweek }}{% endif %}
+      {% if s.manager_id %} · manager {{ s.manager_id }}{% endif %}
+      {% if s.decision_id %} · decision <a href="/decisions/{{ s.manager_id }}#decision-{{ s.decision_id }}" style="color: var(--blue);">#{{ s.decision_id }}</a>{% endif %}
+      {% if s.tokens_in %} · {{ s.tokens_in }}→{{ s.tokens_out }} tok · ${{ "%.5f"|format(s.cost_usd or 0) }}{% endif %}
+    </div>
+    {% if s.detail %}
+    <details>
+      <summary>detail</summary>
+      <div class="step-detail">{{ s.detail | tojson(indent=2) }}</div>
+    </details>
+    {% endif %}
+  </div>
+  {% endfor %}
+
+{% else %}
+  <div class="page-hdr" style="margin-bottom: 32px;">
+    <div class="card-label">// Observability</div>
+    <h1 style="font-family: var(--font-display); font-size: clamp(1.8rem, 4vw, 2.8rem); text-transform: uppercase;">Pipeline Runs</h1>
+  </div>
+
+  {% if not runs %}
+    <div class="card"><p style="color: var(--text-muted);">No runs logged yet — the first /internal/tick will create one.</p></div>
+  {% endif %}
+
+  <div class="card" style="padding: 0;">
+    {% for r in runs %}
+    <a class="run-row" href="/runs/{{ r.run_id }}">
+      <div>
+        <div class="run-id">{{ r.run_id }}</div>
+        <div class="run-meta">{{ r.started_at }}{% if r.gameweek %} · GW{{ r.gameweek }}{% endif %}{% if r.manager_id %} · manager {{ r.manager_id }}{% endif %}</div>
+      </div>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <span class="badge badge-dim">{{ r.step_count }} steps</span>
+        {% if r.total_cost_usd %}<span class="badge badge-blue">${{ "%.5f"|format(r.total_cost_usd) }}</span>{% endif %}
+        {% if r.failed_count > 0 %}
+          <span class="badge badge-rose">{{ r.failed_count }} failed</span>
+        {% else %}
+          <span class="badge badge-emerald">clean</span>
+        {% endif %}
+      </div>
+    </a>
+    {% endfor %}
+  </div>
+{% endif %}
+{% endblock %}

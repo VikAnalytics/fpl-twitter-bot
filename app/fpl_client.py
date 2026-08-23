@@ -117,6 +117,65 @@ def fetch_squad_recent_forms(player_ids: list[int]) -> dict[int, list[int]]:
     return results
 
 
+def fetch_player_history_past(player_id: int) -> list[dict]:
+    """
+    Prior-season summaries (season_name, total_points, minutes, goals, assists, etc.)
+    from the same element-summary endpoint already called for recent form — free,
+    just unused fields until now. Used as the "last season form" ML feature.
+    """
+    try:
+        data = _get(f"{FPL_BASE}/element-summary/{player_id}/")
+        return data.get("history_past", [])
+    except HTTPException:
+        return []
+
+
+def build_team_form(fixtures: list[dict], current_gw: int, lookback: int = 5) -> dict[int, dict]:
+    """
+    team_id -> {results, goals_for, goals_against, points_per_game, goal_diff_per_game}
+    over the last `lookback` finished fixtures. Derived purely from fixtures/ (already
+    fetched), no new API dependency — the "team form" ML feature.
+    """
+    finished = [
+        f for f in fixtures
+        if f.get("finished") and f.get("event") is not None and f["event"] < current_gw
+        and f.get("team_h_score") is not None and f.get("team_a_score") is not None
+    ]
+    finished.sort(key=lambda f: f["event"])
+
+    by_team: dict[int, list[dict]] = {}
+    for f in finished:
+        h, a = f["team_h"], f["team_a"]
+        hs, as_ = f["team_h_score"], f["team_a_score"]
+        by_team.setdefault(h, []).append({"gf": hs, "ga": as_})
+        by_team.setdefault(a, []).append({"gf": as_, "ga": hs})
+
+    result: dict[int, dict] = {}
+    for team_id, matches in by_team.items():
+        recent = matches[-lookback:]
+        gf = sum(m["gf"] for m in recent)
+        ga = sum(m["ga"] for m in recent)
+        points, results = 0, []
+        for m in recent:
+            if m["gf"] > m["ga"]:
+                points += 3
+                results.append("W")
+            elif m["gf"] == m["ga"]:
+                points += 1
+                results.append("D")
+            else:
+                results.append("L")
+        n = len(recent) or 1
+        result[team_id] = {
+            "results": results,
+            "goals_for": gf,
+            "goals_against": ga,
+            "points_per_game": round(points / n, 2),
+            "goal_diff_per_game": round((gf - ga) / n, 2),
+        }
+    return result
+
+
 def fetch_league_standings(manager_id: int) -> list[LeagueStanding]:
     try:
         entry_data = fetch_manager_entry(manager_id)

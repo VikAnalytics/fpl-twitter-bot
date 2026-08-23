@@ -353,6 +353,159 @@ def recently_sold_ids(transfer_history: list[dict], current_gw: int, lookback: i
     }
 
 
+# ─────────────────────── Best XI selection ───────────────────────
+
+# All 8 formations legal under FPL's squad rules: exactly 1 GK, and
+# DEF/MID/FWD each within [3,5]/[2,5]/[1,3] summing to 10 outfield players.
+_VALID_FORMATIONS = [
+    (d, m, 10 - d - m)
+    for d in range(3, 6)
+    for m in range(2, 6)
+    if 1 <= 10 - d - m <= 3
+]
+
+
+@dataclass
+class LineupSelection:
+    starting: list[PlayerSummary]
+    bench: list[PlayerSummary]
+    formation: str  # e.g. "4-4-2"
+    starting_expected_points: float
+
+
+def select_best_xi(squad_15: list[PlayerSummary], predicted_points: dict[int, float]) -> LineupSelection:
+    """
+    Deterministic best-XI selection — no LLM, and deliberately not folded
+    into the transfer debate. For a FIXED formation, the optimal XI is just
+    the top-N predicted-points players per position (points are additive
+    across players with no synergy term, so an exchange argument makes
+    top-N provably optimal within that formation). This brute-forces all 8
+    legal FPL formations and keeps whichever maximizes total predicted
+    points — cheap (8 sums over pre-sorted lists) and exact, not a heuristic.
+    """
+    def _pred(p: PlayerSummary) -> float:
+        return predicted_points.get(p.id, p.ep_next)
+
+    by_pos: dict[str, list[PlayerSummary]] = {"GKP": [], "DEF": [], "MID": [], "FWD": []}
+    for p in squad_15:
+        by_pos.setdefault(p.position, []).append(p)
+    for pos in by_pos:
+        by_pos[pos].sort(key=_pred, reverse=True)
+
+    gk = by_pos["GKP"][:1]
+    best: tuple[float, list[PlayerSummary], str] | None = None
+    for d, m, f in _VALID_FORMATIONS:
+        if d > len(by_pos["DEF"]) or m > len(by_pos["MID"]) or f > len(by_pos["FWD"]):
+            continue
+        xi = gk + by_pos["DEF"][:d] + by_pos["MID"][:m] + by_pos["FWD"][:f]
+        total = sum(_pred(p) for p in xi)
+        if best is None or total > best[0]:
+            best = (total, xi, f"{d}-{m}-{f}")
+
+    if best is None:
+        # Should be unreachable for a legal 2-5-5-3 squad, but degrade to
+        # "whatever's there" rather than crash the pipeline over a formation
+        # edge case (e.g. an incomplete squad mid-transfer-window).
+        xi = squad_15[:11]
+        total = sum(_pred(p) for p in xi)
+        best = (total, xi, "unknown")
+
+    total, xi, formation = best
+    starting_ids = {p.id for p in xi}
+    bench = [p for p in squad_15 if p.id not in starting_ids]
+    return LineupSelection(
+        starting=xi, bench=bench, formation=formation, starting_expected_points=round(total, 2),
+    )
+
+
+# ─────────────────────── Captain & bench ───────────────────────
+
+@dataclass
+class CaptainPick:
+    player: PlayerSummary
+    vice: PlayerSummary
+    expected_points: float
+    vice_expected_points: float
+    rationale: str
+
+
+def score_captain(
+    xi: list[PlayerSummary],
+    predicted_points: dict[int, float],
+    starts_pct_floor: float = 60.0,
+) -> CaptainPick:
+    """
+    Deterministic captain pick — no LLM debate, this is an argmax problem.
+    Score = predicted_points * chance_of_playing, restricted to nailed starters.
+    Fixture (directional FDR) is the tiebreak. Vice = runner-up.
+    """
+    def _weighted(p: PlayerSummary) -> float:
+        chance = (p.chance_of_playing_next_round if p.chance_of_playing_next_round is not None else 100) / 100.0
+        pred = predicted_points.get(p.id, p.ep_next)
+        return pred * chance
+
+    # Rotation-risk filter. Falls back to the full XI if nobody clears the floor
+    # (e.g. early season when starts_pct is still low for everyone).
+    pool = [p for p in xi if p.starts_pct >= starts_pct_floor] or list(xi)
+    ranked = sorted(
+        pool,
+        key=lambda p: (_weighted(p), -_avg_fdr(p.fixtures_next_3)),
+        reverse=True,
+    )
+    top = ranked[0]
+    runner_up = ranked[1] if len(ranked) > 1 else ranked[0]
+
+    rationale = (
+        f"{top.web_name}: {_weighted(top):.1f} weighted expected points "
+        f"({predicted_points.get(top.id, top.ep_next):.1f} pred x "
+        f"{(top.chance_of_playing_next_round or 100)}% chance), "
+        f"fixture FDR {_avg_fdr(top.fixtures_next_3):.1f}. "
+        f"Vice: {runner_up.web_name} ({_weighted(runner_up):.1f})."
+    )
+    return CaptainPick(
+        player=top,
+        vice=runner_up,
+        expected_points=_weighted(top),
+        vice_expected_points=_weighted(runner_up),
+        rationale=rationale,
+    )
+
+
+@dataclass
+class BenchSlot:
+    player: PlayerSummary
+    order: int  # 1 = first sub, ascending priority
+    expected_points: float
+
+
+def order_bench(
+    bench: list[PlayerSummary],
+    predicted_points: dict[int, float],
+) -> list[BenchSlot]:
+    """
+    Deterministic bench order — sort by predicted points * playing-chance.
+    GKP always ranked last (auto-sub rules: outfield subs go in position order,
+    the bench GK only comes on for the starting GK).
+    """
+    def _weighted(p: PlayerSummary) -> float:
+        chance = (p.chance_of_playing_next_round if p.chance_of_playing_next_round is not None else 100) / 100.0
+        pred = predicted_points.get(p.id, p.ep_next)
+        return pred * chance
+
+    outfield = sorted(
+        (p for p in bench if p.position != "GKP"),
+        key=_weighted,
+        reverse=True,
+    )
+    gkp = [p for p in bench if p.position == "GKP"]
+
+    ordered = outfield + gkp
+    return [
+        BenchSlot(player=p, order=i + 1, expected_points=round(_weighted(p), 2))
+        for i, p in enumerate(ordered)
+    ]
+
+
 # ─────────────────────── Feedback loop ───────────────────────
 
 def past_outcome_adjustment(past_outcomes: list) -> dict:
