@@ -21,3 +21,7 @@ fpl-gaffer-extension.zip
 # tools
 graphify-out/
 .obsidian/
+
+# process docs / design notes — not needed for the app to run, kept locally only
+docs/
+obsidian/
