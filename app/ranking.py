@@ -506,30 +506,3 @@ def order_bench(
     ]
 
 
-# ─────────────────────── Feedback loop ───────────────────────
-
-def past_outcome_adjustment(past_outcomes: list) -> dict:
-    """
-    Summarize past suggestion performance to adjust confidence thresholds.
-    Returns {"accuracy": 0.0-1.0, "avg_delta": float, "tighten_confidence": bool, "caveat": str}.
-    """
-    evaluated = [o for o in past_outcomes if o.delta is not None]
-    if not evaluated:
-        return {"accuracy": None, "avg_delta": 0.0, "tighten_confidence": False, "caveat": ""}
-    deltas = [o.delta for o in evaluated]
-    avg_delta = sum(deltas) / len(deltas)
-    wins = sum(1 for d in deltas if d > 0)
-    accuracy = wins / len(deltas)
-    tighten = avg_delta < -2.0 or accuracy < 0.4
-    caveat = ""
-    if tighten:
-        caveat = (
-            f"Recent suggestion track record: {wins}/{len(deltas)} wins, avg delta {avg_delta:+.1f}. "
-            "Be extra skeptical this week."
-        )
-    return {
-        "accuracy": accuracy,
-        "avg_delta": avg_delta,
-        "tighten_confidence": tighten,
-        "caveat": caveat,
-    }

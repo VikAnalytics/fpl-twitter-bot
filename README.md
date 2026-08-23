@@ -23,12 +23,13 @@ See [`docs/architecture.md`](docs/architecture.md) for the full system design, [
 
 ```
 app/
-  main.py           FastAPI routes: brief, decisions view, approve/reject,
+  main.py           FastAPI routes: home, decisions view, approve/reject,
                      /internal/tick webhook, /telegram/webhook, /runs observability
   fpl_client.py     FPL API calls, fixtures, team form/strength, replacements
   fpl_auth.py       Unofficial FPL login + transfer/lineup submission
   ranking.py        Sell/buy scoring, best-XI selection, captain, bench order
-  llm.py            Legacy single-agent brief generator (prompt builders, validators)
+  llm.py            Shared LLM helpers for the debate: web search, grounded-target
+                     formatting, name resolution, transfer validation
   notify.py         Telegram: escalation alerts + decision approval messages
   observability.py  Structured per-run pipeline logging (step() context manager)
   pricing.py        OpenAI token/call cost estimation
@@ -38,7 +39,7 @@ app/
                      escalation checks, weekly pipeline orchestration
   ml/               Feature engineering, model training, scoring-rules table,
                      inference wrapper
-  templates/        Jinja views: /, /audit, /brief, /decisions, /runs
+  templates/        Jinja views: /, /decisions, /runs
 bot.py              Twitter news bot (standalone, independent of app/agents/)
 docs/               Living architecture/plan/progress docs
 obsidian/           Design-decision reasoning trail (Obsidian vault)
@@ -84,25 +85,6 @@ Runs once per gameweek, close to the deadline (`DEBATE_WINDOW_HOURS = 12` in
 Every stage is logged to `pipeline_log` with duration, token usage, and cost —
 `GET /runs` and `GET /runs/{run_id}` surface the full trace for debugging a
 bad decision or a silent failure.
-
-## Legacy single-agent brief (`app/llm.py`)
-
-The original read-only advisory pipeline still exists — `/brief/{manager_id}`
-(web) and `/api/brief/{manager_id}` (JSON) generate a narrative + suggested
-transfers for any manager ID, without executing anything:
-
-1. **Fetch + enrich squad** (`build_squad_picks`) — xG, xA, xGI/90, starts %,
-   set-piece orders, directional FDR per fixture.
-2. **Score sell candidates** (`ranking.score_sell`) — injury doubt,
-   suspension risk, form trend, ep_next, fixtures, rotation risk, xG
-   over-performance, price momentum. Top 5 by urgency.
-3. **Ground buy targets** (`find_valid_replacements`) — filtered by position/
-   club/budget/minutes/availability, ranked by `ranking.score_buy`.
-4. **Generate brief via LLM**, then **validate every suggestion** post-hoc in
-   code (not prompt-side) — position/club/budget/hit-breakeven checks
-   identical in spirit to the new pipeline's backstop.
-5. **Feedback loop** — past suggestions matched against real outcomes,
-   confidence thresholds tighten if the recent track record is poor.
 
 ## Twitter bot (`bot.py`)
 
@@ -177,8 +159,6 @@ python -m app.ml.train                     # (re)train the expected-points model
 
 ## Configuration
 
-- Brief cache: 2 hours per (manager_id, GW)
-- Daily LLM brief limit per manager: 5 (`DAILY_BRIEF_LIMIT`)
 - Bootstrap/fixtures in-memory cache: 5 minutes
 - Debate window: 12h before deadline (`DEBATE_WINDOW_HOURS`)
 - Approval cutoff: deadline−3h; failsafe alert: deadline−1h (`app/agents/escalation_check.py`)
