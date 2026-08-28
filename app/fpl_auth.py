@@ -108,6 +108,28 @@ def fetch_my_team(access_token: str, manager_id: int) -> dict:
     return resp.json()
 
 
+def _post_with_retry(url: str, payload: dict, access_token: str, retries: int, backoff_seconds: int) -> dict:
+    """
+    A 4xx means FPL rejected the payload itself (bad data, invalid move) —
+    retrying an identical payload can't fix that, so those fail immediately,
+    with FPL's actual response body captured (raise_for_status() alone only
+    reports the status code, not why). Only network errors / 5xx are retried.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = requests.post(url, json=payload, headers=_headers(access_token), timeout=20)
+            if 400 <= resp.status_code < 500:
+                return {"ok": False, "error": f"{resp.status_code} {resp.reason}: {resp.text[:1000]}"}
+            resp.raise_for_status()
+            return {"ok": True, "response": resp.json() if resp.content else {}}
+        except requests.RequestException as e:
+            last_error = e
+            if attempt < retries:
+                time.sleep(backoff_seconds)
+    return {"ok": False, "error": str(last_error)}
+
+
 def submit_transfers(
     access_token: str,
     manager_id: int,
@@ -117,19 +139,7 @@ def submit_transfers(
     backoff_seconds: int = 15,
 ) -> dict:
     payload = {"chip": None, "entry": manager_id, "event": gameweek, "transfers": transfers}
-    last_error: Exception | None = None
-    for attempt in range(1, retries + 1):
-        try:
-            resp = requests.post(
-                f"{FPL_BASE}/transfers/", json=payload, headers=_headers(access_token), timeout=20
-            )
-            resp.raise_for_status()
-            return {"ok": True, "response": resp.json() if resp.content else {}}
-        except requests.RequestException as e:
-            last_error = e
-            if attempt < retries:
-                time.sleep(backoff_seconds)
-    return {"ok": False, "error": str(last_error)}
+    return _post_with_retry(f"{FPL_BASE}/transfers/", payload, access_token, retries, backoff_seconds)
 
 
 def set_lineup(
@@ -141,16 +151,4 @@ def set_lineup(
     backoff_seconds: int = 15,
 ) -> dict:
     payload = {"chip": chip, "picks": picks}
-    last_error: Exception | None = None
-    for attempt in range(1, retries + 1):
-        try:
-            resp = requests.post(
-                f"{FPL_BASE}/my-team/{manager_id}/", json=payload, headers=_headers(access_token), timeout=20
-            )
-            resp.raise_for_status()
-            return {"ok": True, "response": resp.json() if resp.content else {}}
-        except requests.RequestException as e:
-            last_error = e
-            if attempt < retries:
-                time.sleep(backoff_seconds)
-    return {"ok": False, "error": str(last_error)}
+    return _post_with_retry(f"{FPL_BASE}/my-team/{manager_id}/", payload, access_token, retries, backoff_seconds)
