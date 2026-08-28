@@ -44,9 +44,18 @@ TIMEOUT_SECONDS = 300.0
 async def _wait_for_session(page) -> dict | None:
     waited = 0.0
     while waited < TIMEOUT_SECONDS:
-        raw = await page.evaluate(
-            "key => window.localStorage.getItem(key)", OIDC_STORAGE_KEY
-        )
+        if page.is_closed():
+            print("Browser window was closed. Nothing saved.", file=sys.stderr)
+            return None
+        try:
+            raw = await page.evaluate(
+                "key => window.localStorage.getItem(key)", OIDC_STORAGE_KEY
+            )
+        except Exception:
+            # The login flow navigates the page several times (FPL -> PingOne
+            # -> back to FPL); evaluate() throws if it lands mid-navigation.
+            # Just skip this poll and try again on the next tick.
+            raw = None
         if raw:
             try:
                 return json.loads(raw)
