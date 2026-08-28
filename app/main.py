@@ -7,7 +7,7 @@ import threading
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
@@ -163,11 +163,18 @@ def _execute_decision(decision_id: int) -> None:
 #
 # GitHub Actions' `schedule:` trigger is unreliable (can be delayed or skipped
 # under load), so scheduling lives outside GitHub entirely: an external cron
-# service (cron-job.org) POSTs here every 30 minutes. This process is
-# long-lived (Cloud Run keeps it warm across requests, or a real VM keeps it
-# warm always), which is also what makes Turso-backed decision state
-# consistent — no more split-brain between a GitHub Actions DB copy and a
-# separately-hosted app's DB copy.
+# service (cron-job.org) POSTs here every 30 minutes.
+#
+# Runs synchronously, in-request — NOT via FastAPI BackgroundTasks. Cloud Run
+# only allocates CPU while a request is actively being served; a background
+# task kicked off after the response is sent gets starved of CPU (or the
+# instance is torn down entirely) and silently never finishes. Confirmed live:
+# every tick before this fix died after logging `ml_predict` "started" with no
+# "succeeded"/"failed" ever following, and zero decisions were ever produced.
+# Running the work inside the request keeps Cloud Run's default CPU
+# allocation active for the whole duration — costs the same compute-seconds
+# either way, just actually completes. Cloud Run's request timeout is raised
+# to cover a full debate run (see deploy notes / `--timeout`).
 
 CRON_SECRET = os.environ.get("CRON_SECRET")
 _tick_lock = threading.Lock()
@@ -178,12 +185,10 @@ def _check_cron_secret(x_cron_secret: str | None) -> None:
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
-def _run_tick(manager_id: int) -> None:
+def _run_tick(manager_id: int, force: bool = False) -> dict:
     """
-    Runs in the background after the webhook request returns 202 — a full
-    debate can take well over cron-job.org's request timeout. Guarded by a
-    lock so an overlapping trigger (e.g. cron-job.org retrying a slow
-    response) skips instead of racing a run already in progress.
+    Guarded by a lock so an overlapping trigger (e.g. cron-job.org retrying a
+    slow response) skips instead of racing a run already in progress.
 
     One run_id ties together every stage this tick touches (pipeline,
     escalation check, evaluate) in pipeline_log — see GET /runs/{run_id}
@@ -191,8 +196,9 @@ def _run_tick(manager_id: int) -> None:
     """
     if not _tick_lock.acquire(blocking=False):
         print("[tick] previous run still in progress, skipping", file=sys.stderr)
-        return
+        return {"skipped": "previous run still in progress"}
     run_id = observability.new_run_id()
+    result = {"run_id": run_id}
     try:
         from .agents.escalation_check import check as escalation_check
         from .agents.evaluate import run_evaluate
@@ -201,31 +207,41 @@ def _run_tick(manager_id: int) -> None:
         print(f"[tick] run_id={run_id}")
 
         try:
-            print(f"[tick] pipeline: {run_weekly_pipeline(manager_id, run_id=run_id)}")
+            result["pipeline"] = run_weekly_pipeline(manager_id, run_id=run_id, force=force)
+            print(f"[tick] pipeline: {result['pipeline']}")
         except Exception as e:  # noqa: BLE001 — one stage failing shouldn't skip the others
+            result["pipeline_error"] = str(e)
             print(f"[tick] pipeline error: {e}", file=sys.stderr)
 
         try:
-            print(f"[tick] escalation: {escalation_check(manager_id, run_id=run_id)}")
+            result["escalation"] = escalation_check(manager_id, run_id=run_id)
+            print(f"[tick] escalation: {result['escalation']}")
         except Exception as e:  # noqa: BLE001
+            result["escalation_error"] = str(e)
             print(f"[tick] escalation error: {e}", file=sys.stderr)
 
         try:
-            print(f"[tick] evaluate: {run_evaluate(run_id=run_id)}")
+            result["evaluate"] = run_evaluate(run_id=run_id)
+            print(f"[tick] evaluate: {result['evaluate']}")
         except Exception as e:  # noqa: BLE001
+            result["evaluate_error"] = str(e)
             print(f"[tick] evaluate error: {e}", file=sys.stderr)
     finally:
         _tick_lock.release()
+    return result
 
 
 @app.post("/internal/tick")
-async def internal_tick(background_tasks: BackgroundTasks, x_cron_secret: str | None = Header(default=None)):
+async def internal_tick(
+    force: bool = False,
+    x_cron_secret: str | None = Header(default=None),
+):
     _check_cron_secret(x_cron_secret)
     manager_id = int(os.environ.get("FPL_MANAGER_ID", 0) or 0)
     if not manager_id:
         raise HTTPException(status_code=500, detail="FPL_MANAGER_ID not configured")
-    background_tasks.add_task(_run_tick, manager_id)
-    return JSONResponse(content={"accepted": True}, status_code=202)
+    result = _run_tick(manager_id, force=force)
+    return JSONResponse(content=result)
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
