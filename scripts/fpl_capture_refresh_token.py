@@ -33,6 +33,12 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from pathlib import Path
+
+# Running this script directly (`python scripts/fpl_capture_refresh_token.py`)
+# puts scripts/ on sys.path, not the repo root — `app` lives at the root, so
+# it isn't importable without this.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 FPL_HOME = "https://fantasy.premierleague.com/"
 OIDC_AUTHORITY = "https://account.premierleague.com/as"
