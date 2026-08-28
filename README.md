@@ -26,7 +26,7 @@ app/
   main.py           FastAPI routes: home, decisions view, approve/reject,
                      /internal/tick webhook, /telegram/webhook, /runs observability
   fpl_client.py     FPL API calls, fixtures, team form/strength, replacements
-  fpl_auth.py       Unofficial FPL login + transfer/lineup submission
+  fpl_auth.py       OAuth (PingOne) access-token refresh + transfer/lineup submission
   ranking.py        Sell/buy scoring, best-XI selection, captain, bench order
   llm.py            Shared LLM helpers for the debate: web search, grounded-target
                      formatting, name resolution, transfer validation
@@ -73,8 +73,9 @@ Runs once per gameweek, close to the deadline (`DEBATE_WINDOW_HOURS = 12` in
    works as a secondary web surface. Unapproved decisions past deadline−3h,
    or approved-but-unexecuted ones past deadline−1h, trigger a hard Telegram
    escalation (`app/agents/escalation_check.py`).
-6. **Execution** — on approval, `app/fpl_auth.py` logs into FPL (unofficial
-   endpoints — FPL has no official transfer API) and submits. Captain/lineup
+6. **Execution** — on approval, `app/fpl_auth.py` exchanges a stored OAuth
+   refresh token for a fresh access token (see "FPL authentication" below)
+   and submits via `x-api-authorization: Bearer <token>`. Captain/lineup
    share one `/my-team/` call, so approving one waits for its sibling before
    submitting the combined payload.
 7. **Feedback loop** — after the gameweek plays out, every candidate the
@@ -126,6 +127,32 @@ requires a token with `Actions: Read and write` permission for the repo.
    `TWITTER_CONSUMER_KEY/SECRET`, `TWITTER_ACCESS_TOKEN/SECRET`,
    `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`.
 
+## FPL authentication
+
+FPL migrated login to PingOne (OAuth2/OIDC) — the old email+password form
+POST to `users.premierleague.com` no longer resolves at all. There's no way
+to script a login against it anymore (nor should there be — PingOne's login
+page is explicitly guarded against bot traffic), so a **real human login,
+once**, is required to bootstrap execution:
+
+```bash
+pip install playwright
+playwright install chromium
+python scripts/fpl_capture_refresh_token.py
+```
+
+A real browser window opens; log in yourself. The script reads the resulting
+OAuth refresh token out of the browser's own session storage (FPL's site
+already requests `offline_access` scope for its own silent token renewal —
+this just reads what it already stores) and saves it to Turso. From then on,
+`app/fpl_auth.py` silently exchanges it for a fresh ~8-hour access token
+before every execution — no browser, no password, no human, fully
+unattended — until the refresh token itself is eventually revoked or
+expires, at which point re-run the script above.
+
+Playwright is **not** a production dependency — it's only needed for this
+one-off local script, so the Cloud Run image stays small.
+
 ## Running locally
 
 ```bash
@@ -136,8 +163,6 @@ pip install -r requirements.txt
 # .env
 OPENAI_API_KEY=...
 FPL_MANAGER_ID=...
-FPL_EMAIL=...              # for autonomous execution — real FPL login
-FPL_PASSWORD=...
 TURSO_DATABASE_URL=...     # https:// scheme — omit to fall back to a local SQLite file (dev only)
 TURSO_AUTH_TOKEN=...
 CRON_SECRET=...            # shared secret for /internal/tick

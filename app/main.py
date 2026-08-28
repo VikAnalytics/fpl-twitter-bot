@@ -19,7 +19,7 @@ from .database import (
     get_run_log, get_recent_runs,
 )
 from . import observability
-from .fpl_auth import FplAuthError, fetch_my_team, login as fpl_login, set_lineup, submit_transfers
+from .fpl_auth import FplAuthError, fetch_my_team, get_access_token, set_lineup, submit_transfers
 from .notify import answer_telegram_callback, escalate_execution_failure
 from .fpl_client import (
     build_player_lookup,
@@ -51,14 +51,14 @@ def _execute_transfer_decision(decision: dict, run_id: str) -> dict:
     if not transfers:
         return {"ok": True, "note": "no transfers to execute"}
 
-    with observability.step(run_id, "execution.login", gameweek=gw, manager_id=manager_id, decision_id=decision["id"]):
-        bootstrap = fetch_bootstrap()
-        player_lookup = build_player_lookup(bootstrap)
-        try:
-            session = fpl_login()
-            my_team = fetch_my_team(session, manager_id)
-        except (FplAuthError, Exception) as e:  # noqa: BLE001 — surfaced to caller for escalation
-            return {"ok": False, "error": str(e)}
+    try:
+        with observability.step(run_id, "execution.login", gameweek=gw, manager_id=manager_id, decision_id=decision["id"]):
+            bootstrap = fetch_bootstrap()
+            player_lookup = build_player_lookup(bootstrap)
+            access_token = get_access_token()
+            my_team = fetch_my_team(access_token, manager_id)
+    except (FplAuthError, Exception) as e:  # noqa: BLE001 — surfaced to caller for escalation
+        return {"ok": False, "error": str(e)}
 
     selling_price_by_id = {p["element"]: p.get("selling_price") for p in my_team.get("picks", [])}
 
@@ -74,7 +74,7 @@ def _execute_transfer_decision(decision: dict, run_id: str) -> dict:
         })
 
     with observability.step(run_id, "execution.submit_transfers", gameweek=gw, manager_id=manager_id, decision_id=decision["id"]) as ctx:
-        result = submit_transfers(session, manager_id, gw, payload)
+        result = submit_transfers(access_token, manager_id, gw, payload)
         ctx["detail"] = {"payload": payload, "result": result}
     return result
 
@@ -100,13 +100,15 @@ def _build_lineup_payload(captain_decision: dict, lineup_decision: dict) -> list
 
 def _execute_lineup_decisions(captain_decision: dict, lineup_decision: dict, run_id: str) -> dict:
     manager_id, gw = lineup_decision["manager_id"], lineup_decision["gameweek"]
+    try:
+        with observability.step(run_id, "execution.login", gameweek=gw, manager_id=manager_id):
+            access_token = get_access_token()
+    except (FplAuthError, Exception) as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+
     with observability.step(run_id, "execution.set_lineup", gameweek=gw, manager_id=manager_id) as ctx:
-        try:
-            session = fpl_login()
-        except (FplAuthError, Exception) as e:  # noqa: BLE001
-            return {"ok": False, "error": str(e)}
         picks = _build_lineup_payload(captain_decision, lineup_decision)
-        result = set_lineup(session, manager_id, picks)
+        result = set_lineup(access_token, manager_id, picks)
         ctx["detail"] = {"picks": picks, "result": result}
     return result
 
