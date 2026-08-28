@@ -484,8 +484,11 @@ def order_bench(
 ) -> list[BenchSlot]:
     """
     Deterministic bench order — sort by predicted points * playing-chance.
-    GKP always ranked last (auto-sub rules: outfield subs go in position order,
-    the bench GK only comes on for the starting GK).
+    GKP always ranked first (FPL's own auto-sub rules require the bench
+    goalkeeper in the first bench slot — confirmed live: the /my-team/
+    endpoint rejects a payload with the bench GK anywhere else with
+    "Sub-position not allowed for element type"). Outfield subs fill the
+    remaining slots in priority order after that.
     """
     def _weighted(p: PlayerSummary) -> float:
         chance = (p.chance_of_playing_next_round if p.chance_of_playing_next_round is not None else 100) / 100.0
@@ -499,7 +502,7 @@ def order_bench(
     )
     gkp = [p for p in bench if p.position == "GKP"]
 
-    ordered = outfield + gkp
+    ordered = gkp + outfield
     return [
         BenchSlot(player=p, order=i + 1, expected_points=round(_weighted(p), 2))
         for i, p in enumerate(ordered)
