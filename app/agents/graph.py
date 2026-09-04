@@ -54,12 +54,65 @@ from .state import DebateState
 _MODEL_NAME = "gpt-4o-mini"
 
 
-def _llm(schema):
-    model = ChatOpenAI(model=_MODEL_NAME, temperature=0.2)
+def _llm(schema, temperature: float = 0.2):
+    model = ChatOpenAI(model=_MODEL_NAME, temperature=temperature)
     # include_raw=True so token usage is available — with_structured_output()
     # alone only returns the parsed object, discarding the raw AIMessage's
     # usage_metadata that cost tracking needs.
     return model.with_structured_output(schema, include_raw=True)
+
+
+def _fixture_for(player, gw: int) -> str:
+    for f in player.fixtures_next_3:
+        if f.event == gw:
+            fdr = f.directional_fdr if f.directional_fdr is not None else float(f.fdr)
+            return f"{f.opp}({f.venue}) FDR {fdr}"
+    return "BLANK (no fixture)"
+
+
+def _proposal_block(state: DebateState) -> str:
+    """
+    The proposal plus a precomputed FACTS table.
+
+    gpt-4o-mini cannot be trusted to compare two numbers in prose: on a live
+    run the moderator wrote "his expected points (ep_next 3.0) are higher than
+    Groß's (ep_next 7.5)" and dropped two good free transfers on the strength
+    of it. Every comparison the debate needs is arithmetic we already have, so
+    compute the deltas here and tell the agents to use them rather than doing
+    mental maths on the context dump.
+    """
+    proposal = state["proposal"] or {}
+    transfers = proposal.get("transfers", [])
+    if not transfers:
+        return f"PROPOSAL UNDER DEBATE:\n{proposal}"
+
+    index = state["context"]["player_index"]
+    gw = state["gameweek"]
+    lines = ["PROPOSAL UNDER DEBATE:"]
+    for t in transfers:
+        out_p = index.get(str(t.get("out", "")).lower())
+        in_p = index.get(str(t.get("in", "")).lower())
+        cost = "POINT HIT (-4)" if t.get("is_hit") else "FREE"
+        lines.append(f"\n  {t.get('out')} -> {t.get('in')}  [{cost}]")
+        lines.append(f"    rationale: {t.get('rationale', '')}")
+        if not out_p or not in_p:
+            continue
+
+        def _avg(p):
+            return sum(p.recent_form_5gw) / len(p.recent_form_5gw) if p.recent_form_5gw else 0.0
+
+        lines.append(
+            "    FACTS (authoritative — use these numbers, do not restate your own):\n"
+            f"      ep_next:      OUT {out_p.ep_next} vs IN {in_p.ep_next}  "
+            f"(delta {in_p.ep_next - out_p.ep_next:+.2f} in favour of {'IN' if in_p.ep_next > out_p.ep_next else 'OUT'})\n"
+            f"      pts/GW so far: OUT {_avg(out_p):.2f} vs IN {_avg(in_p):.2f}  (delta {_avg(in_p) - _avg(out_p):+.2f})\n"
+            f"      xGI/90:       OUT {out_p.xgi_per_90:.2f} vs IN {in_p.xgi_per_90:.2f}  "
+            f"(delta {in_p.xgi_per_90 - out_p.xgi_per_90:+.2f})\n"
+            f"      starts%:      OUT {out_p.starts_pct:.0f}% vs IN {in_p.starts_pct:.0f}%\n"
+            f"      GW{gw} fixture: OUT {_fixture_for(out_p, gw)} vs IN {_fixture_for(in_p, gw)}\n"
+            f"      price:        OUT £{out_p.now_cost}m vs IN £{in_p.now_cost}m"
+        )
+    return "\n".join(lines)
 
 
 def _log(state: DebateState, agent_name: str, message: str) -> None:
@@ -70,7 +123,7 @@ def _context_str(state: DebateState) -> str:
     return state["context"]["prompt_text"]
 
 
-def _invoke_logged(state: DebateState, agent_name: str, schema, messages):
+def _invoke_logged(state: DebateState, agent_name: str, schema, messages, temperature: float = 0.2):
     """
     Runs the LLM call inside an observability.step() so duration, token
     usage, estimated cost, and the full structured output (or the exact
@@ -80,7 +133,7 @@ def _invoke_logged(state: DebateState, agent_name: str, schema, messages):
         state["run_id"], f"debate.{agent_name}",
         gameweek=state["gameweek"], decision_id=state["decision_id"],
     ) as ctx:
-        raw_result = _llm(schema).invoke(messages)
+        raw_result = _llm(schema, temperature).invoke(messages)
         result = raw_result["parsed"]
         if result is None:
             raise ValueError(f"structured output parsing failed: {raw_result.get('parsing_error')}")
@@ -139,7 +192,7 @@ def analyst_node(state: DebateState) -> dict:
 def _debate_turn(state: DebateState, agent_name: str, system: str) -> dict:
     result: AgentTurn = _invoke_logged(
         state, agent_name, AgentTurn,
-        [("system", system), ("user", _context_str(state) + f"\n\nPROPOSAL UNDER DEBATE:\n{state['proposal']}")],
+        [("system", system), ("user", _context_str(state) + "\n\n" + _proposal_block(state))],
     )
     _log(state, agent_name, result.message)
     return {"messages": [{"agent": agent_name, "stance": result.stance, "message": result.message}]}
@@ -164,7 +217,7 @@ def risk_scrutiny_node(state: DebateState) -> dict:
         state, "risk_scrutiny", RiskScrutinyOutput,
         [
             ("system", RISK_SCRUTINY_SYSTEM),
-            ("user", _context_str(state) + f"\n\nPROPOSAL UNDER DEBATE:\n{state['proposal']}" + round_note),
+            ("user", _context_str(state) + "\n\n" + _proposal_block(state) + round_note),
         ],
     )
     _log(state, "risk_scrutiny", result.message)
@@ -190,8 +243,8 @@ def rebuttal_node(state: DebateState) -> dict:
         state, "rebuttal", AgentTurn,
         [
             ("system", REBUTTAL_SYSTEM),
-            ("user", _context_str(state) + f"\n\nYOUR PROPOSAL:\n{state['proposal']}"
-                     f"\n\nOBJECTIONS RAISED:\n{objections}"),
+            ("user", _context_str(state) + "\n\n" + _proposal_block(state)
+                     + f"\n\nOBJECTIONS RAISED:\n{objections}"),
         ],
     )
     _log(state, "rebuttal", result.message)
@@ -221,10 +274,15 @@ def moderator_node(state: DebateState) -> dict:
         f"[{m['agent']}]{(' ' + m['stance']) if 'stance' in m else ''}: {m['message']}"
         for m in state["messages"]
     )
+    # temperature=0: this is the node that decides, and sampling noise was
+    # flipping it. The same code and data produced proceed=true and
+    # proceed=false on consecutive runs.
     result: ModeratorDecision = _invoke_logged(
         state, "moderator", ModeratorDecision,
         [("system", MODERATOR_SYSTEM),
-         ("user", _context_str(state) + f"\n\nFULL DEBATE TRANSCRIPT:\n{transcript}" + _cost_note(state))],
+         ("user", _context_str(state) + "\n\n" + _proposal_block(state)
+                  + f"\n\nFULL DEBATE TRANSCRIPT:\n{transcript}" + _cost_note(state))],
+        temperature=0.0,
     )
     _log(state, "moderator", result.summary)
     final = {
