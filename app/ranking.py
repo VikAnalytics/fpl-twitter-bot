@@ -42,18 +42,34 @@ def _phase_weights(phase: Phase) -> dict[str, float]:
 # ─────────────────────── Form trend ───────────────────────
 
 def form_trend(form_5gw: list[int]) -> str:
-    if not form_5gw or len(form_5gw) < 3:
+    """
+    Recent-vs-older points delta. The split is 2-vs-rest once there are 3+
+    gameweeks; with exactly 2 it falls back to 1-vs-1 rather than returning
+    UNKNOWN, which used to blank out every form signal for the whole squad
+    through GW3 (a <3-length list is all anyone has that early).
+
+    NOTE this measures CHANGE, not LEVEL — a player scoring 1,1,2,1,2 is
+    "STABLE" here and always will be. Absolute level is scored separately in
+    score_sell (see the returns-floor signal).
+    """
+    if not form_5gw or len(form_5gw) < 2:
         return "UNKNOWN"
-    recent = sum(form_5gw[:2]) / 2
-    older = sum(form_5gw[2:]) / len(form_5gw[2:])
+    split = 2 if len(form_5gw) >= 3 else 1
+    recent = sum(form_5gw[:split]) / split
+    older = sum(form_5gw[split:]) / len(form_5gw[split:])
     diff = recent - older
-    if diff <= -1.5:
+    # A 2-GW sample is one gameweek against one gameweek, where a single goal
+    # swings the delta by 4+ — the 1.5/0.5 bands that work on averaged samples
+    # would call 11-then-9 a collapse. Widen them so single-GW noise can't read
+    # as a trend; level at that sample size is score_sell's returns floor.
+    steep, shallow = (1.5, 0.5) if split == 2 else (4.0, 2.0)
+    if diff <= -steep:
         return "DECLINING ↓↓"
-    if diff < -0.5:
+    if diff < -shallow:
         return "DIPPING ↓"
-    if diff >= 1.5:
+    if diff >= steep:
         return "RISING ↑↑"
-    if diff > 0.5:
+    if diff > shallow:
         return "IMPROVING ↑"
     return "STABLE →"
 
@@ -93,6 +109,13 @@ class SellReport:
     trend: str = ""
 
 
+# Points-per-gameweek below which a player is simply not returning. A starter
+# who plays 60+ minutes and does nothing banks 2 (appearance) plus the odd
+# bonus/CS, so these sit just above "turned up and contributed nothing".
+# Defenders/keepers are held to a lower bar than attackers by design.
+_RETURNS_FLOOR = {"GKP": 2.5, "DEF": 2.8, "MID": 3.2, "FWD": 3.2}
+
+
 def score_sell(p: PlayerSummary, gw: int = 20) -> SellReport:
     """
     Urgency score. Higher = more urgent to sell.
@@ -130,6 +153,27 @@ def score_sell(p: PlayerSummary, gw: int = 20) -> SellReport:
         signals.append(f"Form {trend}")
         score += 10 * w["form"]
 
+    # 3b. Absolute return level — form_trend above only measures CHANGE, so a
+    #     player who has been poor every single week reads as "STABLE →" and
+    #     scores nothing from it. That is the gap that let consistent
+    #     non-returners sit in the squad untouched. Score the level itself.
+    sample = list(p.recent_form_5gw or [])
+    if len(sample) >= 2:
+        avg_return, sample_desc = sum(sample) / len(sample), f"last {len(sample)} GW"
+    elif p.points_per_game > 0:
+        avg_return, sample_desc = p.points_per_game, "season ppg"
+    else:
+        avg_return, sample_desc = None, ""
+
+    poor_returns = False
+    floor = _RETURNS_FLOOR.get(p.position, 3.0)
+    if avg_return is not None and avg_return < floor:
+        poor_returns = True
+        deficit = floor - avg_return
+        flags.append(f"consistently poor returns ({avg_return:.1f} pts/GW over {sample_desc}, floor {floor})")
+        signals.append(f"{avg_return:.1f} pts/GW ({sample_desc})")
+        score += (12 + 6 * deficit) * w["form"]
+
     # 4. ep_next
     if p.position != "GKP":
         if p.ep_next < 3.0:
@@ -151,11 +195,31 @@ def score_sell(p: PlayerSummary, gw: int = 20) -> SellReport:
         score += 8 * w["fixtures"]
     score += avg_fdr  # tiebreak
 
-    # 6. Rotation / minutes risk
-    if gw > 6 and p.starts_pct < 70 and p.now_cost >= 6.0:
-        flags.append(f"rotation risk (starts {p.starts_pct:.0f}%)")
-        signals.append(f"Starts {p.starts_pct:.0f}%")
-        score += 10
+    # 6. Minutes — the base rate under every other signal: a player who isn't
+    #    on the pitch cannot return, whatever his price or the gameweek. This
+    #    replaces a starts_pct-only check that was gated to `gw > 6 and
+    #    now_cost >= 6.0`, so it never fired early season and never fired at
+    #    all on cheap dead weight.
+    gws_played = max(gw - 1, 1)
+    minutes_share = p.minutes / (gws_played * 90.0)
+    if gws_played >= 2:
+        if p.minutes == 0:
+            flags.append("no minutes played this season")
+            signals.append("0 minutes")
+            score += 35
+        elif minutes_share < 0.45:
+            flags.append(f"barely playing ({p.minutes} mins, {minutes_share * 100:.0f}% of available)")
+            signals.append(f"{minutes_share * 100:.0f}% of available minutes")
+            score += 22
+        elif minutes_share < 0.70:
+            flags.append(f"limited minutes ({p.minutes} mins, {minutes_share * 100:.0f}% of available)")
+            signals.append(f"{minutes_share * 100:.0f}% of available minutes")
+            score += 10
+        elif p.starts_pct < 70:
+            # Racks up the minutes but often from the bench — rotation risk proper.
+            flags.append(f"rotation risk (starts {p.starts_pct:.0f}%)")
+            signals.append(f"Starts {p.starts_pct:.0f}%")
+            score += 8
 
     # 7. xG over-performance (regression risk) — only mid/late season, attacking players
     if gw >= 10 and p.position in ("MID", "FWD"):
@@ -166,12 +230,24 @@ def score_sell(p: PlayerSummary, gw: int = 20) -> SellReport:
             signals.append(f"Goals+Assists over xG+xA by {over_g + over_a:.1f}")
             score += 8 * w["underlying"]
 
-    # 8. Price drop momentum
+    # 8. Price drop momentum — the market marking the asset down. A confirmed
+    #    drop weighs more than an anticipated one, and both weigh double on a
+    #    player already failing the returns floor: a falling price on someone
+    #    who is delivering is noise, on a non-returner it is corroboration plus
+    #    real team-value bleed. The old `now_cost >= 6.0` gate on the
+    #    transfers-out branch is dropped — cheap dead weight gets churned too,
+    #    and `poor_returns` is what separates signal from enabler churn.
     net = p.transfers_in_event - p.transfers_out_event
-    if p.cost_change_event < 0 or (net < -50_000 and p.now_cost >= 6.0):
-        flags.append("price dropping (heavy transfers out)")
-        signals.append("Mass transfers out")
-        score += 6
+    price_dropped = p.cost_change_event < 0
+    if price_dropped or net < -50_000:
+        drop_score = 10 if price_dropped else 6
+        if poor_returns:
+            drop_score *= 2
+            flags.append("price dropping while not returning (team value bleeding)")
+        else:
+            flags.append("price dropping" if price_dropped else "price drop imminent (heavy transfers out)")
+        signals.append("Price fell this GW" if price_dropped else "Mass transfers out")
+        score += drop_score
 
     return SellReport(
         player=p,

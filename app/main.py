@@ -20,7 +20,7 @@ from .database import (
 )
 from . import observability
 from .fpl_auth import FplAuthError, fetch_my_team, get_access_token, set_lineup, submit_transfers
-from .notify import answer_telegram_callback, escalate_execution_failure
+from .notify import answer_telegram_callback, escalate_execution_failure, send_telegram_alert
 from .fpl_client import (
     build_player_lookup,
     fetch_bootstrap,
@@ -98,19 +98,163 @@ def _build_lineup_payload(captain_decision: dict, lineup_decision: dict) -> list
     return picks
 
 
+def _reconcile_lineup(manager_id: int, gw: int, my_team_picks: list[dict], run_id: str) -> tuple[dict, dict]:
+    """
+    Recomputes the XI, captain and bench from the squad FPL actually holds.
+
+    Called when the approved XI names players who aren't in the live squad —
+    the transfer was rejected after the lineup was projected onto it, or a
+    manual move happened. Submitting the stale payload would send 15 element
+    ids that don't match the squad, so recompute rather than fail the pick.
+    """
+    from .agents.pipeline import _predicted_points_for
+    from .fpl_client import (
+        build_squad_picks, build_team_form, build_team_lookup, build_team_strength_lookup,
+        fetch_fixtures, fetch_squad_recent_forms,
+    )
+    from . import ranking
+
+    bootstrap = fetch_bootstrap()
+    fixtures = fetch_fixtures()
+    player_lookup = build_player_lookup(bootstrap)
+    strength_lookup = build_team_strength_lookup(bootstrap)
+    team_id_by_name = {t["name"]: t["id"] for t in bootstrap["teams"]}
+
+    # /my-team/ mirrors /picks/, but default the slot fields anyway — they're
+    # about to be recomputed and only `element` has to be right.
+    raw_picks = [
+        {
+            "element": p["element"],
+            "position": p.get("position", i + 1),
+            "multiplier": p.get("multiplier", 1),
+            "is_captain": p.get("is_captain", False),
+            "is_vice_captain": p.get("is_vice_captain", False),
+        }
+        for i, p in enumerate(my_team_picks)
+    ]
+    squad = build_squad_picks(
+        raw_picks, player_lookup, build_team_lookup(bootstrap), gw, fixtures, bootstrap,
+        fetch_squad_recent_forms([p["element"] for p in raw_picks]), strength_lookup,
+    )
+    players = [pk.player for pk in squad]
+    preds = _predicted_points_for(
+        players, build_team_form(fixtures, gw), strength_lookup, team_id_by_name
+    )
+
+    selection = ranking.select_best_xi(players, preds)
+    cap = ranking.score_captain(selection.starting, preds)
+    bench_order = ranking.order_bench(selection.bench, preds)
+
+    cap_proposal = {
+        "captain": cap.player.web_name, "captain_id": cap.player.id,
+        "vice": cap.vice.web_name, "vice_id": cap.vice.id, "rationale": cap.rationale,
+    }
+    lineup_proposal = {
+        "formation": selection.formation,
+        "starting_xi": [{"player": p.web_name, "player_id": p.id} for p in selection.starting],
+        "bench_order": [
+            {"player": b.player.web_name, "player_id": b.player.id, "order": b.order} for b in bench_order
+        ],
+    }
+    return cap_proposal, lineup_proposal
+
+
 def _execute_lineup_decisions(captain_decision: dict, lineup_decision: dict, run_id: str) -> dict:
     manager_id, gw = lineup_decision["manager_id"], lineup_decision["gameweek"]
     try:
         with observability.step(run_id, "execution.login", gameweek=gw, manager_id=manager_id):
             access_token = get_access_token()
+            my_team = fetch_my_team(access_token, manager_id)
     except (FplAuthError, Exception) as e:  # noqa: BLE001
         return {"ok": False, "error": str(e)}
+
+    # The XI was chosen before the transfer resolved. Check it against the squad
+    # FPL holds right now and recompute if they've diverged, rather than submit
+    # element ids that are no longer in the squad.
+    live_ids = {p["element"] for p in my_team.get("picks", [])}
+    proposed_ids = (
+        {p["player_id"] for p in lineup_decision["proposal"].get("starting_xi", [])}
+        | {b["player_id"] for b in lineup_decision["proposal"].get("bench_order", [])}
+    )
+    reconciled = False
+    if live_ids and proposed_ids != live_ids:
+        with observability.step(run_id, "execution.reconcile_lineup", gameweek=gw, manager_id=manager_id) as ctx:
+            cap_proposal, lineup_proposal = _reconcile_lineup(manager_id, gw, my_team.get("picks", []), run_id)
+            captain_decision = {**captain_decision, "proposal": cap_proposal}
+            lineup_decision = {**lineup_decision, "proposal": lineup_proposal}
+            reconciled = True
+            ctx["detail"] = {
+                "reason": "approved XI does not match live squad",
+                "missing_from_live": sorted(proposed_ids - live_ids),
+                "unassigned_in_live": sorted(live_ids - proposed_ids),
+                "recomputed_captain": cap_proposal["captain"],
+                "recomputed_xi": [p["player"] for p in lineup_proposal["starting_xi"]],
+            }
 
     with observability.step(run_id, "execution.set_lineup", gameweek=gw, manager_id=manager_id) as ctx:
         picks = _build_lineup_payload(captain_decision, lineup_decision)
         result = set_lineup(access_token, manager_id, picks)
-        ctx["detail"] = {"picks": picks, "result": result}
+        ctx["detail"] = {"picks": picks, "result": result, "reconciled": reconciled}
+
+    if reconciled and result.get("ok"):
+        # Never silently diverge from what was approved.
+        send_telegram_alert(
+            f"♻️ GW{gw} lineup recomputed at submission — your approved XI no longer matched "
+            f"your actual squad (transfer rejected or squad changed manually).\n"
+            f"Submitted XI: {', '.join(p['player'] for p in lineup_decision['proposal']['starting_xi'])}\n"
+            f"Captain: {captain_decision['proposal']['captain']} "
+            f"(vice: {captain_decision['proposal']['vice']})"
+        )
     return result
+
+
+def _pending_transfer(manager_id: int, gameweek: int) -> dict | None:
+    """
+    The gameweek's transfer decision if it hasn't reached a terminal state yet.
+
+    Picks must not be submitted before it resolves. Submit first and FPL
+    auto-places the incoming player when the transfer lands (a player bought to
+    start can end up on the bench); submit after with the pre-transfer XI and
+    the payload names a player no longer in the squad.
+    """
+    for d in get_decisions(manager_id, gameweek, "transfer"):
+        if d["status"] in ("pending_approval", "approved"):
+            return d
+    return None
+
+
+def _try_execute_lineup_pair(manager_id: int, gameweek: int, run_id: str) -> None:
+    """
+    Submits the combined captain+lineup payload once, when every precondition
+    holds: both halves approved, and the gameweek's transfer decision settled.
+    Safe to call repeatedly — it no-ops until then, which is what lets the
+    transfer's own execution (or rejection) trigger the picks that were
+    approved earlier and parked.
+    """
+    captains = get_decisions(manager_id, gameweek, "captain")
+    lineups = get_decisions(manager_id, gameweek, "lineup")
+    captain_decision = captains[0] if captains else None
+    lineup_decision = lineups[0] if lineups else None
+    if captain_decision is None or lineup_decision is None:
+        return
+    if captain_decision["status"] != "approved" or lineup_decision["status"] != "approved":
+        return  # waiting on the other half of the pair (or already submitted)
+
+    blocking = _pending_transfer(manager_id, gameweek)
+    if blocking is not None:
+        print(
+            f"[lineup] GW{gameweek} picks held — transfer #{blocking['id']} still "
+            f"'{blocking['status']}'",
+            file=sys.stderr,
+        )
+        return
+
+    result = _execute_lineup_decisions(captain_decision, lineup_decision, run_id)
+    status = "executed" if result.get("ok") else "failed"
+    set_decision_status(captain_decision["id"], status)
+    set_decision_status(lineup_decision["id"], status)
+    if not result.get("ok"):
+        escalate_execution_failure(gameweek, lineup_decision["id"], result.get("error", "unknown error"))
 
 
 def _execute_decision(decision_id: int) -> None:
@@ -125,6 +269,11 @@ def _execute_decision(decision_id: int) -> None:
     baked in) — so approving one just marks it 'approved' and waits; only
     once BOTH the captain and lineup decisions for the same gameweek are
     approved does this submit the combined payload and mark both 'executed'.
+
+    The picks additionally wait on the TRANSFER decision, because the XI is
+    chosen for the post-transfer squad — so a transfer executing (or being
+    rejected) is itself a trigger to retry the parked picks. Approval order no
+    longer matters: whichever resolves last fires the submission.
     """
     run_id = observability.new_run_id()
     decision = get_agent_decision(decision_id)
@@ -138,27 +287,12 @@ def _execute_decision(decision_id: int) -> None:
         else:
             set_decision_status(decision_id, "failed")
             escalate_execution_failure(decision["gameweek"], decision_id, result.get("error", "unknown error"))
+        # The squad is now settled — release any picks parked behind this.
+        _try_execute_lineup_pair(decision["manager_id"], decision["gameweek"], run_id)
         return
 
     if decision["decision_type"] in ("captain", "lineup"):
-        sibling_type = "lineup" if decision["decision_type"] == "captain" else "captain"
-        siblings = get_decisions(decision["manager_id"], decision["gameweek"], sibling_type)
-        sibling = siblings[0] if siblings else None
-
-        if sibling is None or sibling["status"] not in ("approved", "executed"):
-            return  # waiting on the other half of the pair
-        if sibling["status"] == "executed":
-            return  # already submitted together when the sibling was approved
-
-        captain_decision = decision if decision["decision_type"] == "captain" else sibling
-        lineup_decision = decision if decision["decision_type"] == "lineup" else sibling
-
-        result = _execute_lineup_decisions(captain_decision, lineup_decision, run_id)
-        status = "executed" if result.get("ok") else "failed"
-        set_decision_status(captain_decision["id"], status)
-        set_decision_status(lineup_decision["id"], status)
-        if not result.get("ok"):
-            escalate_execution_failure(decision["gameweek"], decision_id, result.get("error", "unknown error"))
+        _try_execute_lineup_pair(decision["manager_id"], decision["gameweek"], run_id)
 
 
 # ── Scheduled pipeline tick (triggered externally by cron-job.org) ──────────
@@ -312,6 +446,11 @@ def _reject(decision_id: int) -> dict:
     if decision["status"] != "pending_approval":
         return {"ok": False, "error": f"Decision already '{decision['status']}'"}
     set_decision_status(decision_id, "rejected")
+    if decision["decision_type"] == "transfer":
+        # Squad settled (unchanged) — release picks parked behind this transfer.
+        # _execute_lineup_decisions reconciles the XI, which was projected onto
+        # a transfer that is now not happening.
+        _try_execute_lineup_pair(decision["manager_id"], decision["gameweek"], observability.new_run_id())
     return {"ok": True, "decision": get_agent_decision(decision_id)}
 
 

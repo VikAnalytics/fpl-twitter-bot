@@ -12,7 +12,7 @@ from .. import database as db
 from .. import observability
 from ..fpl_client import fetch_bootstrap, fetch_player_gw_points
 
-_DEBATE_PERSONAS = ("fixture_form", "news_injury", "risk_scrutiny")
+_DEBATE_PERSONAS = ("fixture_form", "news_injury", "risk_scrutiny", "rebuttal")
 
 
 def evaluate_gameweek(finished_gw: int, run_id: str | None = None) -> dict:

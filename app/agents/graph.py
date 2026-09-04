@@ -5,7 +5,15 @@ LangGraph state machine for the transfer debate:
                                                  |
                           (extra round if hit/high-risk, capped at 1 extra)
                                                  v
-                                             moderator -> END
+                                            rebuttal -> moderator -> END
+
+The `rebuttal` node exists because risk_scrutiny used to speak LAST, and the
+moderator was told to refuse any proposal whose objections "were not clearly
+answered" — with no node after risk_scrutiny, no objection could ever be
+answered, so `proceed=false` was structurally the default. GW3 lost a free
+Maguire -> De Cuyper transfer 2-1 in favor that way. The analyst now gets a
+right of reply, and the moderator weighs the exchange instead of deferring to
+whoever spoke last (see MODERATOR_SYSTEM in personas.py).
 
 Every node's message is logged to agent_conversations immediately (crash-safe,
 human-readable transcript), AND every node's full structured LLM output
@@ -34,6 +42,7 @@ from .personas import (
     FIXTURE_FORM_SYSTEM,
     MODERATOR_SYSTEM,
     NEWS_INJURY_SYSTEM,
+    REBUTTAL_SYSTEM,
     RISK_SCRUTINY_SYSTEM,
     AgentTurn,
     AnalystOutput,
@@ -154,6 +163,46 @@ def risk_scrutiny_node(state: DebateState) -> dict:
     }
 
 
+def rebuttal_node(state: DebateState) -> dict:
+    """
+    The proposer's right of reply. Without this the moderator's "objections not
+    clearly answered -> proceed=false" rule was unfalsifiable, since nothing
+    ever followed risk_scrutiny.
+    """
+    objections = "\n".join(
+        f"[{m['agent']}]: {m['message']}"
+        for m in state["messages"] if m.get("stance") == "opposed"
+    ) or "No agent opposed the proposal."
+    result: AgentTurn = _invoke_logged(
+        state, "rebuttal", AgentTurn,
+        [
+            ("system", REBUTTAL_SYSTEM),
+            ("user", _context_str(state) + f"\n\nYOUR PROPOSAL:\n{state['proposal']}"
+                     f"\n\nOBJECTIONS RAISED:\n{objections}"),
+        ],
+    )
+    _log(state, "rebuttal", result.message)
+    return {"messages": [{"agent": "rebuttal", "stance": result.stance, "message": result.message}]}
+
+
+def _cost_note(state: DebateState) -> str:
+    """
+    Tells the moderator which bar to apply. A hit is asymmetric and deserves
+    the strict line; a free transfer is bounded downside and shouldn't be held
+    to "proven beyond doubt".
+    """
+    transfers = (state["proposal"] or {}).get("transfers", [])
+    if state["requires_extra_scrutiny"] or any(t.get("is_hit") for t in transfers):
+        return (
+            "\n\nPROPOSAL COST: takes a POINT HIT or was flagged high-risk — apply the "
+            "stricter bar; unanswered objections mean proceed=false."
+        )
+    return (
+        f"\n\nPROPOSAL COST: free transfer ({state['context']['free_transfers']} free this "
+        "week, no points spent) — bounded downside; decide on the balance of evidence."
+    )
+
+
 def moderator_node(state: DebateState) -> dict:
     transcript = "\n".join(
         f"[{m['agent']}]{(' ' + m['stance']) if 'stance' in m else ''}: {m['message']}"
@@ -161,7 +210,8 @@ def moderator_node(state: DebateState) -> dict:
     )
     result: ModeratorDecision = _invoke_logged(
         state, "moderator", ModeratorDecision,
-        [("system", MODERATOR_SYSTEM), ("user", _context_str(state) + f"\n\nFULL DEBATE TRANSCRIPT:\n{transcript}")],
+        [("system", MODERATOR_SYSTEM),
+         ("user", _context_str(state) + f"\n\nFULL DEBATE TRANSCRIPT:\n{transcript}" + _cost_note(state))],
     )
     _log(state, "moderator", result.summary)
     final = {
@@ -176,7 +226,7 @@ def moderator_node(state: DebateState) -> dict:
 def _needs_extra_round(state: DebateState) -> str:
     if state["requires_extra_scrutiny"] and state["scrutiny_rounds_done"] < 2:
         return "extra_round"
-    return "moderate"
+    return "rebut"
 
 
 def build_graph():
@@ -185,6 +235,7 @@ def build_graph():
     g.add_node("fixture_form", fixture_form_node)
     g.add_node("news_injury", news_injury_node)
     g.add_node("risk_scrutiny", risk_scrutiny_node)
+    g.add_node("rebuttal", rebuttal_node)
     g.add_node("moderator", moderator_node)
 
     g.add_edge(START, "analyst")
@@ -194,7 +245,8 @@ def build_graph():
     g.add_conditional_edges(
         "risk_scrutiny",
         _needs_extra_round,
-        {"extra_round": "risk_scrutiny", "moderate": "moderator"},
+        {"extra_round": "risk_scrutiny", "rebut": "rebuttal"},
     )
+    g.add_edge("rebuttal", "moderator")
     g.add_edge("moderator", END)
     return g.compile()

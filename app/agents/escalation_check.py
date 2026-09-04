@@ -44,9 +44,11 @@ def check(manager_id: int, run_id: str | None = None) -> dict:
                 alerts.append(("unapproved", d["id"]))
 
         if hours_left <= FAILSAFE_HOURS:
+            # Any approved-but-unexecuted decision, not just transfers: captain
+            # and lineup now park behind the gameweek's transfer decision, so an
+            # unresolved transfer can leave approved picks unsubmitted too.
             approved_not_executed = [
-                d for d in db.get_decisions(manager_id)
-                if d["decision_type"] == "transfer" and d["status"] == "approved"
+                d for d in db.get_decisions(manager_id) if d["status"] == "approved"
             ]
             for d in approved_not_executed:
                 escalate_failsafe(d["gameweek"], d["id"])

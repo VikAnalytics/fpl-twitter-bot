@@ -84,12 +84,21 @@ def format_decision_summary(decision_type: str, gameweek: int, proposal: dict) -
         if proposal.get("summary"):
             lines.append(proposal["summary"])
         return "\n".join(lines)
+    # The XI and captain are chosen for the squad the transfer proposal would
+    # leave you with, so say so — otherwise the batch reads as three unrelated
+    # messages and an XI containing a player the first message asks you to sell.
+    assumed = proposal.get("assumes_transfer_id")
+    note = (
+        f"\n(assumes transfer #{assumed} is approved — picks are held until it resolves, "
+        "and re-checked against your actual squad before submission)"
+        if assumed else ""
+    )
     if decision_type == "captain":
-        return f"⭐ GW{gameweek} CAPTAIN: {proposal['captain']} (vice: {proposal['vice']})\n{proposal.get('rationale', '')}"
+        return f"⭐ GW{gameweek} CAPTAIN: {proposal['captain']} (vice: {proposal['vice']})\n{proposal.get('rationale', '')}{note}"
     if decision_type == "lineup":
         xi = ", ".join(p["player"] for p in proposal.get("starting_xi", []))
         bench = ", ".join(b["player"] for b in proposal.get("bench_order", []))
-        return f"🧩 GW{gameweek} LINEUP ({proposal.get('formation', '?')})\nXI: {xi}\nBench: {bench}"
+        return f"🧩 GW{gameweek} LINEUP ({proposal.get('formation', '?')})\nXI: {xi}\nBench: {bench}{note}"
     return f"GW{gameweek} {decision_type}: {proposal}"
 
 

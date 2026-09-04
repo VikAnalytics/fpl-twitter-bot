@@ -238,8 +238,45 @@ def run_transfer_debate(
 
 # ── Deterministic XI / captain / bench — no LLM debate, near-argmax decisions ─
 
+def project_squad_after_transfers(squad, transfers: list[dict], grounded_targets: dict):
+    """
+    Applies the pending transfer proposal to the squad IN MEMORY, so the XI /
+    captain / bench are chosen for the team you would actually field if you
+    approve it.
+
+    Without this the lineup was computed on the PRE-transfer squad while the
+    transfer proposal was sent for approval seconds earlier — an approval batch
+    that said "sell Tzolis" and "start Tzolis" thirteen seconds apart, and a
+    picks payload naming a player who would no longer be in the squad once the
+    transfer executed. The submit-time reconciliation in app/main.py is the
+    backstop for when the transfer is then REJECTED and this projection turns
+    out not to hold.
+
+    Returns (projected_squad, incoming_players).
+    """
+    if not transfers:
+        return list(squad), []
+
+    incoming_by_id = {t.id: t for targets in grounded_targets.values() for t in targets}
+    replacement_for, incoming = {}, []
+    for t in transfers:
+        new_player = incoming_by_id.get(t.get("in_id"))
+        if new_player is None:
+            continue  # can't project this one — leave the outgoing player in place
+        replacement_for[t["out_id"]] = new_player
+        incoming.append(new_player)
+
+    projected = [
+        pk.model_copy(update={"player": replacement_for[pk.player.id]})
+        if pk.player.id in replacement_for else pk
+        for pk in squad
+    ]
+    return projected, incoming
+
+
 def run_lineup_selection(
     manager_id: int, gw: int, squad, player_predictions: dict[int, float], run_id: str,
+    assumes_transfer_id: int | None = None,
 ) -> tuple[dict, dict]:
     """
     Picks the best starting XI from the full 15-man squad (formation-aware,
@@ -269,6 +306,7 @@ def run_lineup_selection(
     cap_proposal = {
         "captain": cap.player.web_name, "captain_id": cap.player.id,
         "vice": cap.vice.web_name, "vice_id": cap.vice.id, "rationale": cap.rationale,
+        "assumes_transfer_id": assumes_transfer_id,
     }
     cap_decision_id = db.create_agent_decision(manager_id, gw, "captain", cap_proposal, "High")
     db.log_agent_message(cap_decision_id, gw, 1, "deterministic", cap.rationale)
@@ -278,6 +316,10 @@ def run_lineup_selection(
         "formation": selection.formation,
         "starting_xi": [{"player": p.web_name, "player_id": p.id} for p in selection.starting],
         "bench_order": [{"player": b.player.web_name, "player_id": b.player.id, "order": b.order} for b in bench_order],
+        # Which transfer decision this XI assumes went through. app/main.py
+        # blocks the picks submission until that decision is terminal, and
+        # reconciles the XI against the live squad before submitting.
+        "assumes_transfer_id": assumes_transfer_id,
     }
     lineup_decision_id = db.create_agent_decision(manager_id, gw, "lineup", lineup_proposal, "High")
     db.log_agent_message(
@@ -389,13 +431,32 @@ def run_weekly_pipeline(manager_id: int, dry_run: bool = False, force: bool = Fa
         }
 
     with observability.step(run_id, "pipeline.sell_reports", gameweek=gw, manager_id=manager_id) as ctx:
-        xi_picks = [p for p in squad if p.position <= 11]
-        sell_reports = sorted(
-            (ranking.score_sell(pk.player, gw) for pk in xi_picks), key=lambda r: r.score, reverse=True
-        )[:5]
+        # Score the whole 15, not just the XI — bench dead weight (0 minutes,
+        # price bleeding) was previously unsellable by construction. But a
+        # failing STARTER costs points every single week while a bad bench
+        # player only costs squad value, so the XI is guaranteed 3 of the 5
+        # slots: a 0-minute 4th sub can't crowd out the real problems.
+        by_score = lambda r: r.score
+        xi_reports = sorted(
+            (ranking.score_sell(pk.player, gw) for pk in squad if pk.position <= 11), key=by_score, reverse=True
+        )
+        # The bench GK is excluded: FPL forces you to carry a second keeper who
+        # by design never plays, so he trips the 0-minutes and returns-floor
+        # signals every week and would otherwise top the list forever.
+        bench_reports = sorted(
+            (ranking.score_sell(pk.player, gw) for pk in squad
+             if pk.position > 11 and pk.player.position != "GKP"),
+            key=by_score, reverse=True,
+        )
+        sell_reports = xi_reports[:3] + sorted(xi_reports[3:] + bench_reports, key=by_score, reverse=True)[:2]
+        bench_ids = {pk.player.id for pk in squad if pk.position > 11}
         ctx["detail"] = {
             "top_sell_candidates": [
-                {"player": r.player.web_name, "urgency_score": r.score, "flags": r.flags} for r in sell_reports
+                {
+                    "player": r.player.web_name, "urgency_score": r.score, "flags": r.flags,
+                    "on_bench": r.player.id in bench_ids,
+                }
+                for r in sell_reports
             ]
         }
 
@@ -421,7 +482,27 @@ def run_weekly_pipeline(manager_id: int, dry_run: bool = False, force: bool = Fa
         return {"dry_run": True, "gameweek": gw, "run_id": run_id, "context_preview": context["prompt_text"][:2000]}
 
     transfer_decision = run_transfer_debate(context, manager_id, gw, sell_reports, player_predictions, run_id)
-    captain_decision, lineup_decision = run_lineup_selection(manager_id, gw, squad, player_predictions, run_id)
+
+    # Pick the XI for the squad the transfer proposal would LEAVE you with, not
+    # the one you currently hold — see project_squad_after_transfers.
+    with observability.step(run_id, "lineup.project_squad", gameweek=gw, manager_id=manager_id) as ctx:
+        projected_squad, incoming = project_squad_after_transfers(
+            squad, transfer_decision.get("transfers", []), grounded_targets
+        )
+        if incoming:
+            player_predictions.update(
+                _predicted_points_for(incoming, team_form_lookup, strength_lookup, team_id_by_name)
+            )
+        ctx["detail"] = {
+            "assumes_transfer_id": transfer_decision["decision_id"],
+            "incoming": [p.web_name for p in incoming],
+            "projected_squad": [pk.player.web_name for pk in projected_squad],
+        }
+
+    captain_decision, lineup_decision = run_lineup_selection(
+        manager_id, gw, projected_squad, player_predictions, run_id,
+        assumes_transfer_id=transfer_decision["decision_id"],
+    )
 
     return {
         "gameweek": gw,
