@@ -10,6 +10,7 @@ class Fixture(BaseModel):
     fdr: int     # 1–5, 5 = hardest
     directional_fdr: Optional[float] = None  # position-aware: attack vs opp_defence, or defence vs opp_attack
     event: Optional[int] = None  # gameweek — lets callers tell "plays this GW" from "next fixture is GW+2"
+    opp_id: Optional[int] = None  # opponent team id — `opp` is only a short name, useless for strength lookups
 
 
 class PlayerSummary(BaseModel):

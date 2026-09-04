@@ -48,7 +48,7 @@ from ..fpl_client import (
     get_current_gameweek,  # only used for the picks fetch — see _next_gameweek_id's docstring
 )
 from ..ml import model as ml_model
-from ..ml.features import build_live_inputs
+from ..ml.features import build_live_inputs, opponent_strength
 from .evaluate import build_calibration_context
 from .graph import build_graph
 from .state import DebateState
@@ -61,13 +61,24 @@ DEBATE_WINDOW_HOURS = 12  # only start debating once deadline is within this win
 
 # ── ML predictions for the current squad ─────────────────────────────────────
 
-def _predicted_points_for(players, team_form_lookup, strength_lookup, team_id_by_name) -> dict[int, float]:
+def _predicted_points_for(players, team_form_lookup, strength_lookup, team_id_by_name, gw: int | None = None) -> dict[int, float]:
+    """
+    `gw` picks which fixture the opponent_strength feature describes; without
+    it the player's next fixture is used. Previously this fed the model the
+    player's OWN team strength under the name opponent_strength — see
+    app/ml/features.opponent_strength, which both this and training now use.
+    """
     inputs, ids = [], []
     for p in players:
         team_id = team_id_by_name.get(p.team_name)
         tf = team_form_lookup.get(team_id, {})
-        strength = strength_lookup.get(team_id, {})
-        opp_strength_val = (strength.get("attack_home", 1100) + strength.get("defence_home", 1100)) / 2200.0
+        fixture = next(
+            (f for f in p.fixtures_next_3 if gw is None or f.event == gw),
+            p.fixtures_next_3[0] if p.fixtures_next_3 else None,
+        )
+        opp_strength_val = (
+            opponent_strength(strength_lookup.get(fixture.opp_id), fixture.venue) if fixture else 3.0
+        )
         history_past = fetch_player_history_past(p.id)
         inputs.append(build_live_inputs(p, tf, opp_strength_val, history_past))
         ids.append(p.id)
@@ -451,7 +462,7 @@ def run_weekly_pipeline(manager_id: int, dry_run: bool = False, force: bool = Fa
 
     with observability.step(run_id, "pipeline.ml_predict", gameweek=gw, manager_id=manager_id) as ctx:
         player_predictions = _predicted_points_for(
-            [p.player for p in squad], team_form_lookup, strength_lookup, team_id_by_name
+            [p.player for p in squad], team_form_lookup, strength_lookup, team_id_by_name, gw
         )
         name_by_id = {p.player.id: p.player.web_name for p in squad}
         ctx["detail"] = {
@@ -523,7 +534,7 @@ def run_weekly_pipeline(manager_id: int, dry_run: bool = False, force: bool = Fa
         )
         if incoming:
             player_predictions.update(
-                _predicted_points_for(incoming, team_form_lookup, strength_lookup, team_id_by_name)
+                _predicted_points_for(incoming, team_form_lookup, strength_lookup, team_id_by_name, gw)
             )
         ctx["detail"] = {
             "assumes_transfer_id": transfer_decision["decision_id"],

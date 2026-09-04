@@ -138,7 +138,7 @@ def _reconcile_lineup(manager_id: int, gw: int, my_team_picks: list[dict], run_i
     )
     players = [pk.player for pk in squad]
     preds = _predicted_points_for(
-        players, build_team_form(fixtures, gw), strength_lookup, team_id_by_name
+        players, build_team_form(fixtures, gw), strength_lookup, team_id_by_name, gw
     )
 
     # Same fixture weighting the pipeline used, or a reconcile would silently

@@ -31,6 +31,26 @@ FEATURE_NAMES = [
 ]
 
 
+def opponent_strength(opp_entry: dict | None, player_venue: str) -> float:
+    """
+    Strength of the OPPONENT in the upcoming fixture, on the 1-5 scale
+    build_team_strength_lookup normalizes to. Higher = harder opponent.
+
+    THE single definition, imported by both app/ml/train.py and the live
+    inference path, because they disagreed badly before: training passed
+    `opponent_team` id / 20 (an alphabetical index, not a strength) while
+    inference passed the player's OWN team strength — and that was 0.0 for
+    every player anyway, since FPL had started serving zeros. The feature was
+    noise in training and a constant at inference.
+
+    `player_venue` is the PLAYER's venue, so the opponent's rating is the
+    mirror of it: the player at home faces an opponent playing away.
+    """
+    if not opp_entry:
+        return 3.0
+    return float(opp_entry["overall_away" if player_venue == "H" else "overall_home"])
+
+
 def build_feature_row(inputs: dict) -> dict:
     """Coerce an inputs dict into the fixed feature schema (missing -> 0.0)."""
     return {name: float(inputs.get(name) or 0.0) for name in FEATURE_NAMES}

@@ -324,6 +324,7 @@ def get_next_fixtures(
             fdr=base_fdr,
             directional_fdr=directional,
             event=fix["event"],
+            opp_id=opp_id,
         ))
         if len(result) == n:
             break

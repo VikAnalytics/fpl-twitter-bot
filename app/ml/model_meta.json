@@ -12,9 +12,11 @@
     "starts_pct",
     "ep_next"
   ],
-  "holdout_mae": 0.640952106887428,
-  "training_rows": 25293,
-  "holdout_rows": 4464,
+  "feature_schema_version": 3,
+  "holdout_mae": 1.9789934567872376,
+  "fpl_xp_baseline_mae": 2.6005217391304347,
+  "training_rows": 9773,
+  "holdout_rows": 1725,
   "seasons": [
     "2025-26"
   ]
