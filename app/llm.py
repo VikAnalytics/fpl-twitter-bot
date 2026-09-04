@@ -37,7 +37,7 @@ def _sell_candidates_str(sell_reports: list[ranking.SellReport]) -> str:
     if not sell_reports:
         return "Squad data unavailable."
     lines = []
-    for r in sell_reports[:4]:
+    for r in sell_reports:
         p = r.player
         form_str = "→".join(str(x) for x in p.recent_form_5gw) if p.recent_form_5gw else "N/A"
         fix_str = _fixture_summary(p.fixtures_next_3)

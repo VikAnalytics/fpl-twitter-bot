@@ -117,8 +117,15 @@ def build_transfer_context(squad, sell_reports, grounded_targets, budget, gw, ca
         f"{llm_module._format_grounded_targets(grounded_targets, sell_by_name, gw)}\n\n"
         + (f"LATEST NEWS (web search — press conferences, training reports, outlet coverage):\n{news_context}\n\n" if news_context else "")
         + "RULES: Only propose sells from SELL CANDIDATES. Only propose buys from that "
-        "sell's VERIFIED TRANSFER TARGETS. If free_transfers == 0, any transfer is a "
-        "point hit — set is_hit=true on it.\n\n"
+        "sell's VERIFIED TRANSFER TARGETS.\n"
+        f"You have {budget.free_transfers} free transfer(s) this week, so the first "
+        f"{budget.free_transfers} move(s) you propose cost NOTHING. Consider EVERY sell "
+        "candidate that has a clearly better alternate in its target list, not just the most "
+        "urgent one, and propose up to that many free moves. Free transfers do roll over, so "
+        "an unused one is not wasted — but do not leave a clearly profitable upgrade unmade "
+        "purely to bank it. Order your proposals best-first: anything past the free count "
+        "costs 4 points, so only propose it if the gain clearly beats that. Do not set "
+        "is_hit yourself — it is computed from the free transfer count.\n\n"
         f"CALIBRATION (recent agent track record):\n{calibration_caveat or 'No calibration history yet.'}"
     )
     return {
@@ -181,7 +188,11 @@ def run_transfer_debate(
                     rejected.append({"out": t.get("out"), "in": t.get("in"), "reason": "sell player not resolved"})
                     continue
 
-                if context["free_transfers"] == 0:
+                # A transfer costs a hit once the free ones are spent. This used
+                # to be gated on `free_transfers == 0`, so a third move on two
+                # free transfers skipped the breakeven gate entirely — count the
+                # moves actually accepted so far instead.
+                if len(validated_transfers) >= context["free_transfers"]:
                     sell_report = next((r for r in sell_reports if r.player.id == out_p.id), None)
                     buy_report = ranking.score_buy_report(in_p, out_p, gw)
                     if sell_report and not ranking.hit_breakeven_ok(buy_report, sell_report):
@@ -286,8 +297,29 @@ def run_lineup_selection(
     """
     all_players = [p.player for p in squad]
 
+    # The XI is a ONE-WEEK decision, so weight predictions by this gameweek's
+    # fixture rather than letting the model's (dead) 3-GW average decide it.
+    with observability.step(run_id, "lineup.fixture_weighting", gameweek=gw, manager_id=manager_id) as ctx:
+        weighted = ranking.apply_fixture_weighting(all_players, player_predictions, gw)
+        ctx["detail"] = {
+            "players": [
+                {
+                    "player": p.web_name,
+                    "raw": player_predictions.get(p.id, p.ep_next),
+                    "weight": ranking.gameweek_fixture_weight(p, gw),
+                    "weighted": weighted[p.id],
+                    "fixture": next(
+                        (f"{f.opp}({f.venue}) fdr{f.fdr}/d{f.directional_fdr}"
+                         for f in p.fixtures_next_3 if f.event == gw),
+                        "BLANK",
+                    ),
+                }
+                for p in all_players
+            ]
+        }
+
     with observability.step(run_id, "lineup.select_xi", gameweek=gw, manager_id=manager_id) as ctx:
-        selection = ranking.select_best_xi(all_players, player_predictions)
+        selection = ranking.select_best_xi(all_players, weighted)
         ctx["detail"] = {
             "formation": selection.formation,
             "starting": [p.web_name for p in selection.starting],
@@ -296,11 +328,11 @@ def run_lineup_selection(
         }
 
     with observability.step(run_id, "captain.score", gameweek=gw, manager_id=manager_id) as ctx:
-        cap = ranking.score_captain(selection.starting, player_predictions)
+        cap = ranking.score_captain(selection.starting, weighted)
         ctx["detail"] = {"captain": cap.player.web_name, "vice": cap.vice.web_name, "expected_points": cap.expected_points}
 
     with observability.step(run_id, "lineup.order_bench", gameweek=gw, manager_id=manager_id) as ctx:
-        bench_order = ranking.order_bench(selection.bench, player_predictions)
+        bench_order = ranking.order_bench(selection.bench, weighted)
         ctx["detail"] = {"bench_order": [{"player": b.player.web_name, "order": b.order} for b in bench_order]}
 
     cap_proposal = {
@@ -434,21 +466,21 @@ def run_weekly_pipeline(manager_id: int, dry_run: bool = False, force: bool = Fa
         # Score the whole 15, not just the XI — bench dead weight (0 minutes,
         # price bleeding) was previously unsellable by construction. But a
         # failing STARTER costs points every single week while a bad bench
-        # player only costs squad value, so the XI is guaranteed 3 of the 5
+        # player only costs squad value, so the XI is guaranteed 5 of the 8
         # slots: a 0-minute 4th sub can't crowd out the real problems.
+        #
+        # The bench keeper is scored too, with his not-playing penalties
+        # suppressed (see ranking.score_sell's is_backup_gk) — excluding him
+        # outright meant the keeper slot could never be fixed at all.
         by_score = lambda r: r.score
-        xi_reports = sorted(
-            (ranking.score_sell(pk.player, gw) for pk in squad if pk.position <= 11), key=by_score, reverse=True
-        )
-        # The bench GK is excluded: FPL forces you to carry a second keeper who
-        # by design never plays, so he trips the 0-minutes and returns-floor
-        # signals every week and would otherwise top the list forever.
-        bench_reports = sorted(
-            (ranking.score_sell(pk.player, gw) for pk in squad
-             if pk.position > 11 and pk.player.position != "GKP"),
-            key=by_score, reverse=True,
-        )
-        sell_reports = xi_reports[:3] + sorted(xi_reports[3:] + bench_reports, key=by_score, reverse=True)[:2]
+
+        def _score(pk):
+            is_backup_gk = pk.position > 11 and pk.player.position == "GKP"
+            return ranking.score_sell(pk.player, gw, is_backup_gk=is_backup_gk)
+
+        xi_reports = sorted((_score(pk) for pk in squad if pk.position <= 11), key=by_score, reverse=True)
+        bench_reports = sorted((_score(pk) for pk in squad if pk.position > 11), key=by_score, reverse=True)
+        sell_reports = xi_reports[:5] + sorted(xi_reports[5:] + bench_reports, key=by_score, reverse=True)[:3]
         bench_ids = {pk.player.id for pk in squad if pk.position > 11}
         ctx["detail"] = {
             "top_sell_candidates": [

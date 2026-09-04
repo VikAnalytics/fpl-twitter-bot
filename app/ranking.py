@@ -116,10 +116,19 @@ class SellReport:
 _RETURNS_FLOOR = {"GKP": 2.5, "DEF": 2.8, "MID": 3.2, "FWD": 3.2}
 
 
-def score_sell(p: PlayerSummary, gw: int = 20) -> SellReport:
+def score_sell(p: PlayerSummary, gw: int = 20, is_backup_gk: bool = False) -> SellReport:
     """
     Urgency score. Higher = more urgent to sell.
     Returns SellReport with score + human-readable flags + raw signals.
+
+    `is_backup_gk` marks the bench keeper FPL forces you to carry. He does not
+    play, and that is the plan — scoring him on minutes and returns like an
+    outfield player put him top of the sell list every single week on 0
+    minutes, which is why he was previously excluded from the pool outright.
+    Excluding him was too blunt (the keeper slot could then never be fixed), so
+    instead the not-playing penalties are suppressed and he is judged on what
+    actually matters for a backup: how much money he ties up, and whether he is
+    injured or losing value.
     """
     phase = season_phase(gw)
     w = _phase_weights(phase)
@@ -167,6 +176,8 @@ def score_sell(p: PlayerSummary, gw: int = 20) -> SellReport:
 
     poor_returns = False
     floor = _RETURNS_FLOOR.get(p.position, 3.0)
+    if is_backup_gk:
+        avg_return = None  # zero returns from a bench keeper is the arrangement, not a fault
     if avg_return is not None and avg_return < floor:
         poor_returns = True
         deficit = floor - avg_return
@@ -202,7 +213,15 @@ def score_sell(p: PlayerSummary, gw: int = 20) -> SellReport:
     #    all on cheap dead weight.
     gws_played = max(gw - 1, 1)
     minutes_share = p.minutes / (gws_played * 90.0)
-    if gws_played >= 2:
+    if is_backup_gk:
+        # Judge him on the money he ties up instead. 4.0-4.5 is the enabler
+        # band; anything above that is budget sitting on the bench all season.
+        if p.now_cost > 4.5:
+            excess = p.now_cost - 4.5
+            flags.append(f"backup keeper tying up £{p.now_cost}m (£{excess:.1f}m above enabler price)")
+            signals.append(f"Backup GK at £{p.now_cost}m")
+            score += 12 + excess * 10
+    elif gws_played >= 2:
         if p.minutes == 0:
             flags.append("no minutes played this season")
             signals.append("0 minutes")
@@ -439,6 +458,52 @@ _VALID_FORMATIONS = [
     for m in range(2, 6)
     if 1 <= 10 - d - m <= 3
 ]
+
+
+def gameweek_fixture_weight(p: PlayerSummary, gw: int) -> float:
+    """
+    Multiplier on a player's predicted points for THIS gameweek's fixture.
+
+    The XI is a one-week decision, but the only fixture signal reaching it was
+    the model's `avg_fdr` over the next THREE gameweeks — and that feature is
+    dead anyway (app/ml/train.py hardcodes avg_fdr to 3.0 in training, and
+    `opponent_strength` was trained on opponent_team id / 20, so the model has
+    no working fixture input at all). The three-week average is what started
+    van Ewijk at home to nobody while Coventry played Man City away: his
+    MCI(A) FDR 5 averaged with FDR 2 and 3 into a healthier 3.33 than
+    Ballard's 4.0, whose hard games are LATER.
+
+    Scoring this gameweek's fixture directly, deterministically, keeps the
+    lineup honest without another train/serve skew. Returns 0.0 for a blank
+    (no fixture in `gw` at all) and sums both legs of a double.
+    """
+    legs = [f for f in p.fixtures_next_3 if f.event == gw]
+    if not legs:
+        return 0.0
+
+    # Keepers and defenders live on clean sheets, which are close to binary and
+    # almost entirely opponent-driven — a defender away at the best team in the
+    # league is a different asset from the same defender at home to the worst.
+    # Attackers travel better: a premium forward scores against anyone, so his
+    # fixture matters but nothing like as much.
+    sensitivity = 0.16 if p.position in ("GKP", "DEF") else 0.10
+
+    total = 0.0
+    for f in legs:
+        fdr = f.directional_fdr if f.directional_fdr is not None else float(f.fdr)
+        # DEF: FDR 1 -> 1.32, 3 -> 1.0, 5 -> 0.68.  MID/FWD: 1.2 / 1.0 / 0.8.
+        total += max(0.5, min(1.4, 1.0 + (3.0 - fdr) * sensitivity))
+    return round(total, 3)
+
+
+def apply_fixture_weighting(
+    players: list[PlayerSummary], predicted_points: dict[int, float], gw: int
+) -> dict[int, float]:
+    """Predicted points scaled by this gameweek's fixture — see gameweek_fixture_weight."""
+    return {
+        p.id: round(predicted_points.get(p.id, p.ep_next) * gameweek_fixture_weight(p, gw), 3)
+        for p in players
+    }
 
 
 @dataclass

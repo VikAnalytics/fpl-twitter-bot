@@ -12,7 +12,13 @@ class TransferProposal(BaseModel):
     out: str = Field(description="web_name of the player to sell, must be from SELL CANDIDATES")
     in_: str = Field(alias="in", description="web_name of the player to buy, must be from that sell's VERIFIED TRANSFER TARGETS")
     rationale: str = Field(description="2-3 sentences citing concrete data from context")
-    is_hit: bool = Field(description="true if this transfer spends a point hit (beyond free transfers)")
+    is_hit: bool = Field(
+        default=False,
+        description=(
+            "Leave false — the graph overwrites this deterministically from the free "
+            "transfer count. Do not try to work it out yourself."
+        ),
+    )
 
     model_config = {"populate_by_name": True}
 
@@ -46,10 +52,15 @@ class ModeratorDecision(BaseModel):
 ANALYST_SYSTEM = (
     "You are the Analyst agent in an FPL (Fantasy Premier League) transfer debate. "
     "Propose the best transfer(s) using ONLY the sell candidates and verified grounded "
-    "buy targets given in context — never invent a player not listed there. It is fine "
-    "to propose zero transfers if nothing is compelling. List any strong alternate buy "
-    "targets you seriously considered but didn't pick, in `alternates_considered`, so "
-    "their outcomes can be tracked against the pick you made."
+    "buy targets given in context — never invent a player not listed there. "
+    "Work through the sell candidates in order and judge each one against the targets "
+    "available for it; propose a move for every candidate whose best target is a clear "
+    "upgrade, up to the number of free transfers stated in context. Do not stop at one "
+    "move when a second free transfer is available and a second candidate plainly "
+    "deserves replacing. It is still fine to propose zero transfers if nothing is "
+    "compelling. List any strong alternate buy targets you seriously considered but "
+    "didn't pick, in `alternates_considered`, so their outcomes can be tracked against "
+    "the pick you made."
 )
 
 FIXTURE_FORM_SYSTEM = (
@@ -98,6 +109,10 @@ MODERATOR_SYSTEM = (
     "doubt, and holding a free transfer is not a neutral act — it forfeits a gameweek of "
     "upside. For a proposal that takes a POINT HIT, or that was flagged requires_extra_scrutiny, "
     "hold the stricter line: if Risk/Scrutiny's objections were not clearly answered, set "
-    "proceed=false rather than push through a weak one. Confidence should reflect how one-sided "
-    "the debate was — 'High' only when there was little real disagreement."
+    "proceed=false rather than push through a weak one. "
+    "Judge each proposed transfer on its own merits and carry through every one that stands — "
+    "a weak second move should be dropped, not used as a reason to drop a strong first one, "
+    "and a strong second move should not be discarded just because it wasn't the headline. "
+    "Confidence should reflect how one-sided the debate was — 'High' only when there was "
+    "little real disagreement."
 )

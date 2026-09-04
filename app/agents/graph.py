@@ -102,8 +102,21 @@ def analyst_node(state: DebateState) -> dict:
         state, "analyst", AnalystOutput,
         [("system", ANALYST_SYSTEM), ("user", _context_str(state))],
     )
+    # Whether a move costs a hit is arithmetic — transfers beyond the free
+    # count — not something to ask the LLM to judge. Left to the model it got
+    # this wrong in the obvious direction: with 2 free transfers it stamped
+    # is_hit=true on BOTH proposals, which flipped risk_scrutiny into its
+    # strict hit bar and killed two free upgrades. Stamp it deterministically
+    # so every downstream agent argues about the real cost.
+    free = state["context"].get("free_transfers", 0)
+    for i, t in enumerate(result.transfers):
+        t.is_hit = i >= free
+
     if result.transfers:
-        msg = "; ".join(f"{t.out} -> {t.in_}: {t.rationale}" for t in result.transfers)
+        msg = "; ".join(
+            f"{t.out} -> {t.in_}{' (HIT)' if t.is_hit else ' (free)'}: {t.rationale}"
+            for t in result.transfers
+        )
     else:
         msg = "No transfer recommended this week."
     _log(state, "analyst", msg)

@@ -9,6 +9,7 @@ class Fixture(BaseModel):
     venue: str   # "H" or "A"
     fdr: int     # 1–5, 5 = hardest
     directional_fdr: Optional[float] = None  # position-aware: attack vs opp_defence, or defence vs opp_attack
+    event: Optional[int] = None  # gameweek — lets callers tell "plays this GW" from "next fixture is GW+2"
 
 
 class PlayerSummary(BaseModel):

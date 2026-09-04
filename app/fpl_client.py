@@ -217,19 +217,40 @@ def build_team_lookup(bootstrap: dict) -> dict[int, str]:
     return {t["id"]: t["short_name"] for t in bootstrap["teams"]}
 
 
+def _norm_strength(value, fallback) -> float:
+    """
+    Normalizes a team strength field onto FPL's 1-5 tier scale.
+
+    FPL has served strength on two different scales — a 1000-1400 rating
+    historically, and 1-5 tiers now — and currently returns a literal 0 for
+    every strength_attack_* / strength_defence_* field. Because the KEY is
+    present, `t.get(key, 1100)` never fired its default: the lookup produced
+    zeros, _directional_fdr computed `(0 - 0) / 100 = 0`, and every directional
+    FDR silently collapsed to the base FDR. Treat 0/None as absent and fall
+    back to the overall rating, which FPL does populate.
+    """
+    v = float(value or 0)
+    if v <= 0:
+        v = float(fallback or 3)
+    if v > 10:  # legacy 1000-1400 rating
+        v = (v - 900) / 100.0
+    return max(1.0, min(5.0, v))
+
+
 def build_team_strength_lookup(bootstrap: dict) -> dict[int, dict]:
-    """team_id -> {attack_home, attack_away, defence_home, defence_away, overall_home, overall_away}."""
-    return {
-        t["id"]: {
-            "attack_home":   t.get("strength_attack_home",   1100),
-            "attack_away":   t.get("strength_attack_away",   1100),
-            "defence_home":  t.get("strength_defence_home",  1100),
-            "defence_away":  t.get("strength_defence_away",  1100),
-            "overall_home":  t.get("strength_overall_home",  1100),
-            "overall_away":  t.get("strength_overall_away",  1100),
+    """team_id -> {attack_home, attack_away, defence_home, defence_away, overall_home, overall_away}, all on a 1-5 scale."""
+    lookup = {}
+    for t in bootstrap["teams"]:
+        home, away = t.get("strength_overall_home"), t.get("strength_overall_away")
+        lookup[t["id"]] = {
+            "attack_home":   _norm_strength(t.get("strength_attack_home"),   home),
+            "attack_away":   _norm_strength(t.get("strength_attack_away"),   away),
+            "defence_home":  _norm_strength(t.get("strength_defence_home"),  home),
+            "defence_away":  _norm_strength(t.get("strength_defence_away"),  away),
+            "overall_home":  _norm_strength(home, 3),
+            "overall_away":  _norm_strength(away, 3),
         }
-        for t in bootstrap["teams"]
-    }
+    return lookup
 
 
 def _directional_fdr(
@@ -258,10 +279,13 @@ def _directional_fdr(
         opp_rating = opp["attack_home"]  if venue == "A" else opp["attack_away"]
         own_rating = own["defence_home"] if venue == "H" else own["defence_away"]
 
-    # Normalize: strength typically 1000–1400. Delta / 100 shifts FDR by ±1
-    delta = (opp_rating - own_rating) / 100.0
-    directional = base_fdr + (delta * 0.5)
-    return max(1.0, min(5.0, directional))
+    # Ratings are on FPL's 1-5 scale (see _norm_strength), so delta spans
+    # -4..+4 and 0.4 shifts the base FDR by at most ±1.6. The old /100.0 came
+    # from the retired 1000-1400 rating scale and rounded to nothing once FPL
+    # switched, which is half of why directional FDR stopped doing anything.
+    delta = opp_rating - own_rating
+    directional = base_fdr + (delta * 0.4)
+    return max(1.0, min(5.0, round(directional, 2)))
 
 
 def get_next_fixtures(
@@ -299,6 +323,7 @@ def get_next_fixtures(
             venue=venue,
             fdr=base_fdr,
             directional_fdr=directional,
+            event=fix["event"],
         ))
         if len(result) == n:
             break
