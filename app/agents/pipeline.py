@@ -409,6 +409,20 @@ def _next_gameweek_id(bootstrap: dict) -> int | None:
     return None
 
 
+def _fetch_my_team_transfers(manager_id: int) -> tuple[dict | None, str]:
+    """Authenticated /my-team/ `transfers` block, or None (with the reason)
+    if auth isn't set up / FPL is down, so the derived fallback can run."""
+    try:
+        from ..fpl_auth import FplAuthError, fetch_my_team, get_access_token
+        my_team = fetch_my_team(get_access_token(), manager_id)
+        transfers = my_team.get("transfers")
+        if not isinstance(transfers, dict):
+            return None, "my_team_missing_transfers"
+        return transfers, "my_team"
+    except Exception as e:  # noqa: BLE001 — never let budget lookup kill the run
+        return None, f"fallback:{type(e).__name__}:{e}"[:200]
+
+
 def run_weekly_pipeline(manager_id: int, dry_run: bool = False, force: bool = False, run_id: str | None = None) -> dict:
     run_id = run_id or observability.new_run_id()
     bootstrap = fetch_bootstrap()
@@ -453,10 +467,16 @@ def run_weekly_pipeline(manager_id: int, dry_run: bool = False, force: bool = Fa
         squad = build_squad_picks(
             raw_picks, player_lookup, team_lookup, gw, fixtures, bootstrap, recent_forms, strength_lookup
         )
-        budget = build_budget_info(entry_history, transfer_history, gw)
+        # Free-transfer count comes from FPL's own /my-team/ `transfers` block
+        # (exact, sees banked transfers up to 5). entry_history describes
+        # gw_picks, not gw — see build_budget_info for why that matters.
+        my_team_transfers, budget_source = _fetch_my_team_transfers(manager_id)
+        budget = build_budget_info(entry_history, transfer_history, gw, gw_picks, my_team_transfers)
         ctx["detail"] = {
             "squad_size": len(squad), "active_chip": active_chip,
             "itb": budget.itb, "free_transfers": budget.free_transfers,
+            "transfers_made": budget.transfers_made, "budget_source": budget_source,
+            "my_team_transfers": my_team_transfers,
             "gw_picks": gw_picks, "gw_target": gw,
         }
 

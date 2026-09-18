@@ -67,18 +67,57 @@ def fetch_transfer_history(manager_id: int) -> list[dict]:
     return data if isinstance(data, list) else []
 
 
-def build_budget_info(entry_history: dict, transfer_history: list[dict], current_gw: int) -> BudgetInfo:
-    transfers_made = entry_history.get("event_transfers") or 0
-    # Count transfers used last GW to determine if one was banked
+def build_budget_info(
+    entry_history: dict,
+    transfer_history: list[dict],
+    current_gw: int,
+    picks_gw: int | None = None,
+    my_team_transfers: dict | None = None,
+) -> BudgetInfo:
+    """
+    `current_gw` is the gameweek the decision is FOR; `picks_gw` is the
+    gameweek `entry_history` was fetched for (the last locked one, since FPL
+    404s picks for a gameweek that hasn't started). Before the fix these were
+    conflated: GW4's `event_transfers` was treated as "transfers already made
+    in GW5" AND as the reason GW5 got no rollover, so one transfer last week
+    produced 0 free transfers this week.
+
+    Preferred source is the authenticated /my-team/ `transfers` block, which
+    reports FPL's own `limit` (free transfers for the upcoming GW, banked up to
+    5 under current rules) and `made`. The derived formula is only a fallback
+    for when auth isn't available, and it can't see banked transfers beyond 2.
+    """
+    picks_gw = current_gw if picks_gw is None else picks_gw
+    same_gw = picks_gw == current_gw
+    itb = round((entry_history.get("bank") or 0) / 10, 1)
+    team_value = round((entry_history.get("value") or 0) / 10, 1)
+
+    if my_team_transfers:
+        made = my_team_transfers.get("made") or 0
+        limit = my_team_transfers.get("limit")
+        # limit is null on a wildcard / free hit ("unlimited")
+        free_transfers = 15 if limit is None else max(0, int(limit) - made)
+        return BudgetInfo(
+            itb=round((my_team_transfers.get("bank") or entry_history.get("bank") or 0) / 10, 1),
+            team_value=round((my_team_transfers.get("value") or entry_history.get("value") or 0) / 10, 1),
+            transfers_made=made,
+            # `cost` is the per-transfer price (4), not points deducted
+            hit_cost=max(0, made - (limit or made)) * (my_team_transfers.get("cost") or 4),
+            free_transfers=free_transfers,
+        )
+
+    # Fallback: entry_history only describes picks_gw. If that's a previous
+    # gameweek, nothing has been made or paid for in current_gw yet.
+    transfers_made = (entry_history.get("event_transfers") or 0) if same_gw else 0
+    hit_cost = (entry_history.get("event_transfers_cost") or 0) if same_gw else 0
     prev_gw_used = sum(1 for t in transfer_history if t.get("event") == current_gw - 1)
     available = 2 if (current_gw > 1 and prev_gw_used == 0) else 1
-    free_transfers = max(0, available - transfers_made)
     return BudgetInfo(
-        itb=round((entry_history.get("bank") or 0) / 10, 1),
-        team_value=round((entry_history.get("value") or 0) / 10, 1),
+        itb=itb,
+        team_value=team_value,
         transfers_made=transfers_made,
-        hit_cost=entry_history.get("event_transfers_cost") or 0,
-        free_transfers=free_transfers,
+        hit_cost=hit_cost,
+        free_transfers=max(0, available - transfers_made),
     )
 
 
