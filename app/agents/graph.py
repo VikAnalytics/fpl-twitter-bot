@@ -49,7 +49,7 @@ from .personas import (
     ModeratorDecision,
     RiskScrutinyOutput,
 )
-from ..ranking import _avg_fdr
+from ..ranking import _avg_fdr, cs_record_str, expected_cs_points
 from .state import DebateState
 
 _MODEL_NAME = "gpt-4o-mini"
@@ -125,7 +125,14 @@ def _proposal_block(state: DebateState) -> str:
             f"      next-3 avg FDR (lower = easier): OUT {fdr_out:.2f} vs IN {fdr_in:.2f}  "
             f"(swing {fdr_out - fdr_in:+.2f} in favour of {'IN' if fdr_in < fdr_out else 'OUT'})\n"
             f"      GW{gw} fixture: OUT {_fixture_for(out_p, gw)} vs IN {_fixture_for(in_p, gw)}\n"
-            f"      FPL ep_next (backward-looking form estimate): OUT {out_p.ep_next} vs IN {in_p.ep_next}  "
+            + (
+                f"      clean-sheet outlook (exp CS pts next 3): OUT {expected_cs_points(out_p):.1f} vs IN {expected_cs_points(in_p):.1f}  "
+                f"(delta {expected_cs_points(in_p) - expected_cs_points(out_p):+.1f})\n"
+                f"      record:       OUT {cs_record_str(out_p)}, xGC/90 {out_p.xgc_per_90:.2f} vs IN {cs_record_str(in_p)}, xGC/90 {in_p.xgc_per_90:.2f}\n"
+                f"      DC/90:        OUT {out_p.dc_per_90:.1f} vs IN {in_p.dc_per_90:.1f}  (2pts at 10 for DEF)\n"
+                if out_p.position in ("GKP", "DEF") or in_p.position in ("GKP", "DEF") else ""
+            )
+            + f"      FPL ep_next (backward-looking form estimate): OUT {out_p.ep_next} vs IN {in_p.ep_next}  "
             f"(delta {in_p.ep_next - out_p.ep_next:+.2f})\n"
             f"      price:        OUT £{out_p.now_cost}m vs IN £{in_p.now_cost}m"
         )

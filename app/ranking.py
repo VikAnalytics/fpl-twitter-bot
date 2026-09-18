@@ -11,6 +11,8 @@ Central scoring logic for transfer suggestions.
 """
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -34,6 +36,10 @@ def _ep_weight(phase: Phase) -> float:
     """Multiplier on FPL's ep_next in score_buy. Early season ep_next is just
     points-per-game over 2-4 samples, so it gets the least say."""
     return 1.0 if phase == "EARLY" else 2.0
+
+
+def gws_played_for(gw: int) -> int:
+    return max(gw - 1, 1)
 
 
 def _phase_weights(phase: Phase) -> dict[str, float]:
@@ -102,6 +108,54 @@ def _xg_overperformance(p: PlayerSummary) -> float:
 
 def _xa_overperformance(p: PlayerSummary) -> float:
     return p.assists - p.xa
+
+
+# ─────────────────────── Defensive returns ───────────────────────
+#
+# For a defender the clean sheet (4) is the return, not the goal — and xGI/90
+# said nothing about it, so a full-back on a side conceding two a game
+# out-scored a centre-back on a side conceding none. These estimate the
+# defensive points a player is actually in line for over his next fixtures.
+
+_LEAGUE_AVG_GOALS_CONCEDED = 1.4   # per game; the prior when xGC/90 isn't yet meaningful
+_CS_POINTS = {"GKP": 4, "DEF": 4, "MID": 1, "FWD": 0}
+_DC_THRESHOLD = {"GKP": None, "DEF": 10, "MID": 12, "FWD": 12}
+
+
+def _fixture_goal_factor(f: Fixture) -> float:
+    """Scale a per-90 concession rate by the fixture: directional FDR 3 is
+    par, 1 is ~0.6x (weak attack), 5 is ~1.4x (strong attack)."""
+    d = f.directional_fdr if f.directional_fdr is not None else float(f.fdr)
+    return 0.4 + 0.2 * d
+
+
+def expected_cs_points(p: PlayerSummary, horizon: int = 3) -> float:
+    """Expected clean-sheet points over the next `horizon` fixtures.
+    P(CS) per fixture is Poisson zero on (xGC/90 × fixture factor)."""
+    cs_pts = _CS_POINTS.get(p.position, 0)
+    if not cs_pts:
+        return 0.0
+    rate = p.xgc_per_90 if (p.xgc_per_90 > 0 and p.minutes >= 90) else _LEAGUE_AVG_GOALS_CONCEDED
+    fixtures = p.fixtures_next_3[:horizon]
+    if not fixtures:
+        return cs_pts * math.exp(-rate) * horizon
+    return sum(cs_pts * math.exp(-rate * _fixture_goal_factor(f)) for f in fixtures)
+
+
+def expected_dc_points(p: PlayerSummary, horizon: int = 3) -> float:
+    """Expected defensive-contribution points (2 per game the threshold is
+    cleared). dc_per_90 is an average, so treat the threshold as a ramp:
+    4 below it → 0, at it → 0.5, 4 above → 1."""
+    thr = _DC_THRESHOLD.get(p.position)
+    if thr is None or p.minutes < 90:
+        return 0.0
+    p_hit = max(0.0, min(1.0, (p.dc_per_90 - thr + 4) / 8))
+    return 2 * p_hit * horizon
+
+
+def cs_record_str(p: PlayerSummary) -> str:
+    """'2 CS / 4 GC in 4 apps' — the record, for prompts."""
+    return f"{p.clean_sheets} CS, {p.goals_conceded} conceded in {max(p.appearances, 1)} apps"
 
 
 # ─────────────────────── Sell scoring ───────────────────────
@@ -199,6 +253,16 @@ def score_sell(p: PlayerSummary, gw: int = 20, is_backup_gk: bool = False) -> Se
             score += 15
         elif p.ep_next < 4.5:
             score += 5
+
+    # 4b. Clean-sheet outlook — a defender whose side keeps conceding is not
+    #     returning whatever his xGI says. Under 3 expected CS points across
+    #     the next 3 (≈ one clean sheet in four) is a sell signal in itself.
+    if p.position in ("GKP", "DEF") and not is_backup_gk and gws_played_for(gw) >= 2:
+        cs_pts = expected_cs_points(p)
+        if cs_pts < 3.0:
+            flags.append(f"weak clean-sheet outlook ({cs_pts:.1f} exp CS pts next 3; {cs_record_str(p)}, xGC/90 {p.xgc_per_90:.2f})")
+            signals.append(f"Exp CS pts next 3: {cs_pts:.1f}")
+            score += 8 * w["fixtures"]
 
     # 5. Fixtures (directional when available)
     avg_fdr = _avg_fdr(p.fixtures_next_3, directional=True)
@@ -310,15 +374,37 @@ def score_buy_report(c: PlayerSummary, vs_sold: PlayerSummary, gw: int = 20) -> 
     #    evidence in five costumes. Early season it is shrunk further.
     score += c.ep_next * _ep_weight(phase)
 
-    # 1b. Underlying threat, minutes-weighted — the forward-looking anchor.
-    #     xGI/90 says what a player creates when on the pitch; minutes share
-    #     says how much pitch he gets. Elite attacker (0.8 xGI/90, every
-    #     minute) ≈ +20 at neutral weight, a rotation-risk defender ≈ +2.
+    # 1b. Underlying returns, minutes-weighted — the forward-looking anchor.
+    #     Attackers: xGI/90 (what he creates on the pitch). Elite attacker
+    #     (0.8 xGI/90, every minute) ≈ +20 at neutral weight.
+    #     Defenders/keepers: the clean sheet IS the return. xGI still counts,
+    #     at half weight, since a goal is 6 for a defender — but it no longer
+    #     lets a full-back on a side conceding two a game beat a centre-back
+    #     behind a wall. Expected CS points over the next 3 (0-12) weigh ×2,
+    #     so a 3-clean-sheet outlook ≈ +24 and a no-hoper ≈ +2.
     minutes_share = min(1.0, c.minutes / (max(gw - 1, 1) * 90.0)) if gw > 1 else (c.starts_pct / 100.0)
-    threat = c.xgi_per_90 * minutes_share * 25 * w["underlying"]
+    defensive = c.position in ("GKP", "DEF")
+    threat = c.xgi_per_90 * minutes_share * (12 if defensive else 25) * w["underlying"]
     if threat >= 12:
         signals.append(f"threat {c.xgi_per_90:.2f} xGI/90 at {minutes_share * 100:.0f}% mins")
     score += threat
+
+    cs_outlook = expected_cs_points(c)          # if he plays every minute
+    cs_pts = cs_outlook * minutes_share          # what he's actually in line for
+    if defensive:
+        signals.append(f"exp CS pts next 3: {cs_outlook:.1f} ({cs_record_str(c)}, xGC/90 {c.xgc_per_90:.2f})")
+        if cs_outlook >= 6:
+            flags.append(f"strong clean-sheet outlook ({cs_outlook:.1f} exp CS pts next 3)")
+        elif cs_outlook < 3:
+            flags.append(f"weak clean-sheet outlook ({cs_outlook:.1f} exp CS pts next 3, {cs_record_str(c)})")
+    score += cs_pts * 2 * w["underlying"]
+
+    # 1d. Defensive contribution (2pts a game at 10 CBIT for DEF / 12 CBIRT
+    #     for MID-FWD) — the new floor for ball-winners, invisible to xGI.
+    dc_pts = expected_dc_points(c) * minutes_share
+    if dc_pts >= 3:
+        signals.append(f"DC/90 {c.dc_per_90:.1f} (~{dc_pts:.1f} DC pts next 3)")
+    score += dc_pts * 1.5
 
     # 1c. Fixture swing vs the player being sold, over the next 3 — the
     #     comparison that actually matters for a swap, independent of ep_next.
@@ -340,8 +426,12 @@ def score_buy_report(c: PlayerSummary, vs_sold: PlayerSummary, gw: int = 20) -> 
     elif "DECLINING" in trend or "DIPPING" in trend:
         score -= 12 * w["form"]
 
-    # 3. Underlying xGI_per_90
-    if c.xgi_per_90 >= 0.6:
+    # 3. Underlying xGI_per_90 band — attackers only. For a defender the
+    #    minutes-weighted threat term in 1b already prices his xGI; stacking
+    #    this band on top was the "goals overpower clean sheets" problem.
+    if defensive:
+        pass
+    elif c.xgi_per_90 >= 0.6:
         flags.append(f"elite xGI/90 ({c.xgi_per_90:.2f})")
         signals.append(f"xGI/90 {c.xgi_per_90:.2f}")
         score += 14 * w["underlying"]
@@ -410,10 +500,7 @@ def score_buy_report(c: PlayerSummary, vs_sold: PlayerSummary, gw: int = 20) -> 
         if role_diff > 0.35:
             score -= 6  # role mismatch
 
-    # 10. Clean-sheet potential for DEF/GKP
-    if c.position in ("DEF", "GKP") and c.xgc_per_90 and c.xgc_per_90 < 1.0:
-        signals.append(f"xGC/90 {c.xgc_per_90:.2f}")
-        score += 6
+    # 10. (clean-sheet potential now scored properly in 1b)
 
     # 11. Ownership — differential vs template depends on caller; surface as signal
     signals.append(f"{c.selected_by_percent}% owned")

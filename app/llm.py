@@ -76,6 +76,8 @@ def _format_grounded_targets(
                 + (f" | model xP:{predictions[t.id]:.2f}" if predictions and t.id in predictions else "")
                 + f" | ep_next:{t.ep_next} | form:{t.form} | 5GW:{form_str}\n"
                 f"      xGI/90 {t.xgi_per_90:.2f} | Starts {t.starts_pct:.0f}% | "
+                + (f"CS outlook next 3: {ranking.expected_cs_points(t):.1f} pts ({ranking.cs_record_str(t)}, xGC/90 {t.xgc_per_90:.2f}) | DC/90 {t.dc_per_90:.1f} | " if t.position in ("GKP", "DEF") else "")
+                + 
                 f"{'PEN1' if t.penalties_order == 1 else ''}"
                 f"{' DFK' + str(t.direct_freekicks_order) if t.direct_freekicks_order and t.direct_freekicks_order <= 2 else ''}"
                 f"\n      Fixtures: {fix_str}"

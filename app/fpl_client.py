@@ -428,6 +428,8 @@ def _build_player_summary(
         goals_scored=int(p.get("goals_scored") or 0),
         assists=int(p.get("assists") or 0),
         clean_sheets=int(p.get("clean_sheets") or 0),
+        goals_conceded=int(p.get("goals_conceded") or 0),
+        dc_per_90=float(p.get("defensive_contribution_per_90") or 0),
         minutes=minutes,
         starts=starts,
         appearances=appearances,
@@ -557,7 +559,10 @@ def find_valid_replacements(
         return []
 
     # First-pass rank by composite (no form trend yet)
-    feasible.sort(key=lambda x: ranking.score_buy(x, sell_player), reverse=True)
+    # `current_gw` matters: score_buy's phase weights default to mid-season,
+    # so without it the shortlist was ranked on different weights from the
+    # scores the prompt then displayed, and the order looked random.
+    feasible.sort(key=lambda x: ranking.score_buy(x, sell_player, current_gw), reverse=True)
     shortlist = feasible[: max(top_n * 2, 15)]
 
     # Enrich shortlist with recent_form_5gw (parallel fetch)
@@ -567,7 +572,7 @@ def find_valid_replacements(
             c.recent_form_5gw = forms.get(c.id, [])
 
     # Re-rank with form trend available
-    shortlist.sort(key=lambda x: ranking.score_buy(x, sell_player), reverse=True)
+    shortlist.sort(key=lambda x: ranking.score_buy(x, sell_player, current_gw), reverse=True)
     return shortlist[:top_n]
 
 
