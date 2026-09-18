@@ -16,6 +16,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Literal
 
+from .ml.features import clean_sheet_prob, concession_rate, fixture_goal_factor
 from .models import Fixture, PlayerSummary
 
 
@@ -117,29 +118,27 @@ def _xa_overperformance(p: PlayerSummary) -> float:
 # out-scored a centre-back on a side conceding none. These estimate the
 # defensive points a player is actually in line for over his next fixtures.
 
-_LEAGUE_AVG_GOALS_CONCEDED = 1.4   # per game; the prior when xGC/90 isn't yet meaningful
 _CS_POINTS = {"GKP": 4, "DEF": 4, "MID": 1, "FWD": 0}
 _DC_THRESHOLD = {"GKP": None, "DEF": 10, "MID": 12, "FWD": 12}
 
 
-def _fixture_goal_factor(f: Fixture) -> float:
-    """Scale a per-90 concession rate by the fixture: directional FDR 3 is
-    par, 1 is ~0.6x (weak attack), 5 is ~1.4x (strong attack)."""
-    d = f.directional_fdr if f.directional_fdr is not None else float(f.fdr)
-    return 0.4 + 0.2 * d
+def _cs_prob(p: PlayerSummary, f: Fixture | None) -> float:
+    """P(clean sheet) in fixture f — app/ml/features.clean_sheet_prob, the one
+    definition shared with the model's training and inference."""
+    if f is None:
+        return clean_sheet_prob(p.xgc_per_90, p.minutes, None)
+    return clean_sheet_prob(p.xgc_per_90, p.minutes, f.directional_fdr, float(f.fdr))
 
 
 def expected_cs_points(p: PlayerSummary, horizon: int = 3) -> float:
-    """Expected clean-sheet points over the next `horizon` fixtures.
-    P(CS) per fixture is Poisson zero on (xGC/90 × fixture factor)."""
+    """Expected clean-sheet points over the next `horizon` fixtures."""
     cs_pts = _CS_POINTS.get(p.position, 0)
     if not cs_pts:
         return 0.0
-    rate = p.xgc_per_90 if (p.xgc_per_90 > 0 and p.minutes >= 90) else _LEAGUE_AVG_GOALS_CONCEDED
     fixtures = p.fixtures_next_3[:horizon]
     if not fixtures:
-        return cs_pts * math.exp(-rate) * horizon
-    return sum(cs_pts * math.exp(-rate * _fixture_goal_factor(f)) for f in fixtures)
+        return cs_pts * _cs_prob(p, None) * horizon
+    return sum(cs_pts * _cs_prob(p, f) for f in fixtures)
 
 
 def expected_dc_points(p: PlayerSummary, horizon: int = 3) -> float:
@@ -628,10 +627,6 @@ def _gw_fdr(p: PlayerSummary, gw: int) -> float:
     return sum((f.directional_fdr if f.directional_fdr is not None else float(f.fdr)) for f in legs) / len(legs)
 
 
-def _concession_rate(p: PlayerSummary) -> float:
-    return p.xgc_per_90 if (p.xgc_per_90 > 0 and p.minutes >= 90) else _LEAGUE_AVG_GOALS_CONCEDED
-
-
 def structural_defensive_xp(p: PlayerSummary, gw: int) -> float | None:
     """
     Points a DEF/GKP is in line for THIS gameweek, built from the scoring
@@ -651,7 +646,7 @@ def structural_defensive_xp(p: PlayerSummary, gw: int) -> float | None:
         return 0.0
     total = 0.0
     for f in legs:
-        lam = _concession_rate(p) * _fixture_goal_factor(f)
+        lam = concession_rate(p.xgc_per_90, p.minutes) * fixture_goal_factor(f.directional_fdr, float(f.fdr))
         p_cs = math.exp(-lam)
         pts = 2.0 + 4.0 * p_cs - 0.5 * max(0.0, lam - 1.0) + 0.4 * p_cs
         if p.position == "DEF":

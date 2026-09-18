@@ -13,8 +13,9 @@ xgc_per_90, avg_fdr, starts_pct, ep_next) reused rather than recomputed.
 """
 from __future__ import annotations
 
-from .. import ranking
-from ..models import PlayerSummary
+import math
+
+from ..models import Fixture, PlayerSummary
 
 FEATURE_NAMES = [
     "form",
@@ -28,7 +29,45 @@ FEATURE_NAMES = [
     "avg_fdr",
     "starts_pct",
     "ep_next",
+    # v4 — the model had no idea what position a player was, so a defender's
+    # prediction was an attacker's prediction with less xGI; clean sheets,
+    # saves and defensive contributions were invisible to it.
+    "pos_gkp",
+    "pos_def",
+    "pos_mid",
+    "pos_fwd",
+    "cs_prob_gw",       # P(clean sheet) this fixture, from xGC/90 and the opponent
+    "saves_per_90",
+    "dc_per_90",
 ]
+
+LEAGUE_AVG_GOALS_CONCEDED = 1.4   # per game; the prior before a player has 90 minutes of xGC
+
+
+def fixture_goal_factor(directional_fdr: float | None, base_fdr: float = 3.0) -> float:
+    """Scale a per-90 concession rate by the fixture: directional FDR 3 is
+    par, 1 is ~0.6x (weak attack), 5 is ~1.4x (strong attack)."""
+    d = directional_fdr if directional_fdr is not None else float(base_fdr)
+    return 0.4 + 0.2 * d
+
+
+def concession_rate(xgc_per_90: float, minutes: float) -> float:
+    return xgc_per_90 if (xgc_per_90 > 0 and minutes >= 90) else LEAGUE_AVG_GOALS_CONCEDED
+
+
+def clean_sheet_prob(xgc_per_90: float, minutes: float, directional_fdr: float | None, base_fdr: float = 3.0) -> float:
+    """Poisson zero on the fixture-scaled concession rate. THE definition —
+    used by training, live inference and ranking alike."""
+    return math.exp(-concession_rate(xgc_per_90, minutes) * fixture_goal_factor(directional_fdr, base_fdr))
+
+
+def position_one_hot(position: str) -> dict[str, float]:
+    return {
+        "pos_gkp": 1.0 if position == "GKP" else 0.0,
+        "pos_def": 1.0 if position == "DEF" else 0.0,
+        "pos_mid": 1.0 if position == "MID" else 0.0,
+        "pos_fwd": 1.0 if position == "FWD" else 0.0,
+    }
 
 
 def opponent_strength(opp_entry: dict | None, player_venue: str) -> float:
@@ -65,6 +104,7 @@ def build_live_inputs(
     team_form: dict,
     opponent_strength_value: float,
     history_past: list[dict],
+    gw_fixture: Fixture | None = None,
 ) -> dict:
     """
     Assemble a feature-input dict for a live player at inference time.
@@ -87,7 +127,17 @@ def build_live_inputs(
         vals = [f.directional_fdr if f.directional_fdr is not None else float(f.fdr) for f in player.fixtures_next_3]
         avg_fdr = sum(vals) / len(vals)
 
+    fixture = gw_fixture or (player.fixtures_next_3[0] if player.fixtures_next_3 else None)
+    cs_prob = clean_sheet_prob(
+        player.xgc_per_90, player.minutes,
+        fixture.directional_fdr if fixture else None, float(fixture.fdr) if fixture else 3.0,
+    )
+
     return {
+        **position_one_hot(player.position),
+        "cs_prob_gw": cs_prob,
+        "saves_per_90": player.saves_per_90,
+        "dc_per_90": player.dc_per_90,
         "form": player.form,
         "team_ppg": team_form.get("points_per_game", 1.0) if team_form else 1.0,
         "team_gd_pg": team_form.get("goal_diff_per_game", 0.0) if team_form else 0.0,

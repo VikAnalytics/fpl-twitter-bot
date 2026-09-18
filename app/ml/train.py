@@ -61,7 +61,9 @@ from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import train_test_split
 
 from ..fpl_client import _directional_fdr, _norm_strength
-from .features import FEATURE_NAMES, build_feature_row, feature_vector, opponent_strength
+from .features import (
+    FEATURE_NAMES, build_feature_row, clean_sheet_prob, feature_vector, opponent_strength, position_one_hot,
+)
 from .scoring_rules import compute_points, normalize_position
 
 VAASTAV_BASE = "https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data"
@@ -77,7 +79,7 @@ SEASONS = ["2025-26"]
 # v3 also narrowed the TARGET POPULATION to gameweeks the player featured in,
 # which moves MAE onto a different, higher-variance distribution — again not
 # comparable with the previous number.
-FEATURE_SCHEMA_VERSION = 3
+FEATURE_SCHEMA_VERSION = 4
 
 # Used only to source the `last_season_pts_per90` feature.
 _SEASON_BEFORE = {"2025-26": "2024-25", "2026-27": "2025-26"}
@@ -241,7 +243,7 @@ def _build_training_rows(
 
         history_points: list[float] = []
         history_starts: list[float] = []
-        cum_xgi = cum_xgc = cum_minutes = 0.0
+        cum_xgi = cum_xgc = cum_minutes = cum_saves = cum_dc = 0.0
 
         for row in rows:
             gw = int(_to_float(row.get("GW") or row.get("round"), 0))
@@ -255,6 +257,8 @@ def _build_training_rows(
             # xGI to predict this row's points would be leakage.
             xgi_90 = (cum_xgi / cum_minutes * 90.0) if cum_minutes >= 90 else 0.0
             xgc_90 = (cum_xgc / cum_minutes * 90.0) if cum_minutes >= 90 else 0.0
+            saves_90 = (cum_saves / cum_minutes * 90.0) if cum_minutes >= 90 else 0.0
+            dc_90 = (cum_dc / cum_minutes * 90.0) if cum_minutes >= 90 else 0.0
 
             legs = schedule.get(team_id, []) if team_id else []
             this_leg = next((l for l in legs if l["event"] == gw), None)
@@ -267,7 +271,18 @@ def _build_training_rows(
             else:
                 avg_fdr = 3.0
 
+            # This leg's directional FDR for the player's position (defensive
+            # orientation for GKP/DEF), exactly as get_next_fixtures computes
+            # it live, so cs_prob_gw means the same thing in both places.
+            this_dfdr = (
+                _directional_fdr(position, team_id, this_leg["opp_id"], this_leg["venue"], strength, this_leg["fdr"])
+                if this_leg else None
+            )
             inputs = {
+                **position_one_hot(position),
+                "cs_prob_gw": clean_sheet_prob(xgc_90, cum_minutes, this_dfdr, float(this_leg["fdr"]) if this_leg else 3.0),
+                "saves_per_90": saves_90,
+                "dc_per_90": dc_90,
                 "form": prior_form,
                 "team_ppg": team_form.get((team_id, gw), {}).get("points_per_game", 1.0),
                 "team_gd_pg": team_form.get((team_id, gw), {}).get("goal_diff_per_game", 0.0),
@@ -309,6 +324,8 @@ def _build_training_rows(
             cum_xgi += _to_float(row.get("expected_goal_involvements"))
             cum_xgc += _to_float(row.get("expected_goals_conceded"))
             cum_minutes += _to_float(row.get("minutes"))
+            cum_saves += _to_float(row.get("saves"))
+            cum_dc += _to_float(row.get("defensive_contribution"))
     return X, y
 
 
@@ -357,7 +374,10 @@ def train() -> dict:
     monotonic_cst = {
         "form": 1, "team_ppg": 1, "team_gd_pg": 1, "opponent_strength": -1,
         "last_season_pts_per90": 1, "chance_of_playing": 0, "xgi_per_90": 1,
-        "xgc_per_90": 0, "avg_fdr": -1, "starts_pct": 1, "ep_next": 1,
+        "xgc_per_90": -1, "avg_fdr": -1, "starts_pct": 1, "ep_next": 1,
+        # v4: position is a label, not an ordering; the rest can only help.
+        "pos_gkp": 0, "pos_def": 0, "pos_mid": 0, "pos_fwd": 0,
+        "cs_prob_gw": 1, "saves_per_90": 1, "dc_per_90": 1,
     }
     model = HistGradientBoostingRegressor(
         max_depth=6,

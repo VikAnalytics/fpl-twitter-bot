@@ -83,7 +83,7 @@ def _predicted_points_for(players, team_form_lookup, strength_lookup, team_id_by
             opponent_strength(strength_lookup.get(fixture.opp_id), fixture.venue) if fixture else 3.0
         )
         history_past = history_by_id.get(p.id, [])
-        inputs.append(build_live_inputs(p, tf, opp_strength_val, history_past))
+        inputs.append(build_live_inputs(p, tf, opp_strength_val, history_past, gw_fixture=fixture))
         ids.append(p.id)
     preds = ml_model.predict_points(inputs)
     return dict(zip(ids, preds))
