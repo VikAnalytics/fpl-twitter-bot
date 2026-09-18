@@ -40,6 +40,7 @@ class PlayerSummary(BaseModel):
     clean_sheets: int = 0
     goals_conceded: int = 0
     dc_per_90: float = 0.0         # defensive contributions (CBIT / CBIRT) per 90 — 2pts at 10 (DEF) / 12 (MID, FWD)
+    saves_per_90: float = 0.0      # GKP: 1pt per 3 saves
 
     # Minutes / rotation
     minutes: int = 0

@@ -430,6 +430,7 @@ def _build_player_summary(
         clean_sheets=int(p.get("clean_sheets") or 0),
         goals_conceded=int(p.get("goals_conceded") or 0),
         dc_per_90=float(p.get("defensive_contribution_per_90") or 0),
+        saves_per_90=float(p.get("saves_per_90") or 0),
         minutes=minutes,
         starts=starts,
         appearances=appearances,

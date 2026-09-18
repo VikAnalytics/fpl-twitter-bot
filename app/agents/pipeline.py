@@ -331,43 +331,38 @@ def run_lineup_selection(
     """
     all_players = [p.player for p in squad]
 
-    # The XI is a ONE-WEEK decision, so weight predictions by this gameweek's
-    # fixture rather than letting the model's (dead) 3-GW average decide it.
-    with observability.step(run_id, "lineup.fixture_weighting", gameweek=gw, manager_id=manager_id) as ctx:
-        weighted = ranking.apply_fixture_weighting(all_players, player_predictions, gw)
+    # One computation feeds XI, captain and bench — see ranking.build_lineup.
+    with observability.step(run_id, "lineup.expected_points", gameweek=gw, manager_id=manager_id) as ctx:
+        lineup = ranking.build_lineup(all_players, player_predictions, gw)
         ctx["detail"] = {
             "players": [
                 {
-                    "player": p.web_name,
-                    "raw": player_predictions.get(p.id, p.ep_next),
-                    "weight": ranking.gameweek_fixture_weight(p, gw),
-                    "weighted": weighted[p.id],
+                    "player": v.player.web_name, "position": v.player.position,
+                    "model_xp": v.model_xp, "structural_xp": v.structural_xp,
+                    "legs": v.legs, "chance": v.chance, "points": v.points,
                     "fixture": next(
                         (f"{f.opp}({f.venue}) fdr{f.fdr}/d{f.directional_fdr}"
-                         for f in p.fixtures_next_3 if f.event == gw),
+                         for f in v.player.fixtures_next_3 if f.event == gw),
                         "BLANK",
                     ),
                 }
-                for p in all_players
+                for v in sorted(lineup.points.values(), key=lambda v: -v.points)
             ]
         }
 
+    selection, cap, bench_order = lineup.selection, lineup.captain, lineup.bench_order
     with observability.step(run_id, "lineup.select_xi", gameweek=gw, manager_id=manager_id) as ctx:
-        selection = ranking.select_best_xi(all_players, weighted)
         ctx["detail"] = {
             "formation": selection.formation,
             "starting": [p.web_name for p in selection.starting],
             "bench": [p.web_name for p in selection.bench],
             "starting_expected_points": selection.starting_expected_points,
+            "confidence": lineup.confidence, "confidence_note": lineup.confidence_note,
         }
-
     with observability.step(run_id, "captain.score", gameweek=gw, manager_id=manager_id) as ctx:
-        cap = ranking.score_captain(selection.starting, weighted)
-        ctx["detail"] = {"captain": cap.player.web_name, "vice": cap.vice.web_name, "expected_points": cap.expected_points}
-
+        ctx["detail"] = {"captain": cap.player.web_name, "vice": cap.vice.web_name, "expected_points": cap.expected_points, "rationale": cap.rationale}
     with observability.step(run_id, "lineup.order_bench", gameweek=gw, manager_id=manager_id) as ctx:
-        bench_order = ranking.order_bench(selection.bench, weighted)
-        ctx["detail"] = {"bench_order": [{"player": b.player.web_name, "order": b.order} for b in bench_order]}
+        ctx["detail"] = {"bench_order": [{"player": b.player.web_name, "order": b.order, "expected_points": b.expected_points} for b in bench_order]}
 
     cap_proposal = {
         "captain": cap.player.web_name, "captain_id": cap.player.id,
@@ -387,10 +382,11 @@ def run_lineup_selection(
         # reconciles the XI against the live squad before submitting.
         "assumes_transfer_id": assumes_transfer_id,
     }
-    lineup_decision_id = db.create_agent_decision(manager_id, gw, "lineup", lineup_proposal, "High")
+    lineup_decision_id = db.create_agent_decision(manager_id, gw, "lineup", lineup_proposal, lineup.confidence)
     db.log_agent_message(
         lineup_decision_id, gw, 1, "deterministic",
-        f"Formation {selection.formation} ({selection.starting_expected_points} pred pts). "
+        f"Formation {selection.formation} ({selection.starting_expected_points} pred pts, "
+        f"confidence {lineup.confidence}: {lineup.confidence_note}). "
         "Bench order: " + ", ".join(f"{b.order}. {b.player.web_name}" for b in bench_order),
     )
     send_decision_for_approval(lineup_decision_id, format_decision_summary("lineup", gw, lineup_proposal))

@@ -146,11 +146,14 @@ def expected_dc_points(p: PlayerSummary, horizon: int = 3) -> float:
     """Expected defensive-contribution points (2 per game the threshold is
     cleared). dc_per_90 is an average, so treat the threshold as a ramp:
     4 below it → 0, at it → 0.5, 4 above → 1."""
+    return 2 * _dc_hit_prob(p) * horizon
+
+
+def _dc_hit_prob(p: PlayerSummary) -> float:
     thr = _DC_THRESHOLD.get(p.position)
     if thr is None or p.minutes < 90:
         return 0.0
-    p_hit = max(0.0, min(1.0, (p.dc_per_90 - thr + 4) / 8))
-    return 2 * p_hit * horizon
+    return max(0.0, min(1.0, (p.dc_per_90 - thr + 4) / 8))
 
 
 def cs_record_str(p: PlayerSummary) -> str:
@@ -589,51 +592,114 @@ _VALID_FORMATIONS = [
 ]
 
 
-def gameweek_fixture_weight(p: PlayerSummary, gw: int) -> float:
-    """
-    Multiplier on a player's predicted points for THIS gameweek's fixture.
+# ─────────────────────── Lineup: per-player points for THIS gameweek ───────────
+#
+# One place computes the number every lineup decision (XI, captain, bench)
+# ranks on, so the three can't disagree about availability or fixtures the
+# way they used to: the XI ignored chance_of_playing while captain and bench
+# applied it, and this week's fixture was priced three times over (the
+# model's opponent_strength, the model's avg_fdr, then a multiplier on top —
+# the multiplier's docstring predated the retrain that made the model's own
+# fixture inputs work).
 
-    The XI is a one-week decision, but the only fixture signal reaching it was
-    the model's `avg_fdr` over the next THREE gameweeks — and that feature is
-    dead anyway (app/ml/train.py hardcodes avg_fdr to 3.0 in training, and
-    `opponent_strength` was trained on opponent_team id / 20, so the model has
-    no working fixture input at all). The three-week average is what started
-    van Ewijk at home to nobody while Coventry played Man City away: his
-    MCI(A) FDR 5 averaged with FDR 2 and 3 into a healthier 3.33 than
-    Ballard's 4.0, whose hard games are LATER.
+_FORMATION_MIN = {"GKP": 1, "DEF": 3, "MID": 2, "FWD": 1}
+_FORMATION_MAX = {"GKP": 1, "DEF": 5, "MID": 5, "FWD": 3}
+_BASE_MISS_PROB = 0.08   # a fully fit starter still misses ~1 game in 12 (late knocks, rotation)
 
-    Scoring this gameweek's fixture directly, deterministically, keeps the
-    lineup honest without another train/serve skew. Returns 0.0 for a blank
-    (no fixture in `gw` at all) and sums both legs of a double.
+
+def _chance(p: PlayerSummary) -> float:
+    return (100 if p.chance_of_playing_next_round is None else p.chance_of_playing_next_round) / 100.0
+
+
+def _minutes_share(p: PlayerSummary, gw: int) -> float:
+    if gw <= 1:
+        return p.starts_pct / 100.0
+    return min(1.0, p.minutes / (max(gw - 1, 1) * 90.0))
+
+
+def _gw_legs(p: PlayerSummary, gw: int) -> list[Fixture]:
+    return [f for f in p.fixtures_next_3 if f.event == gw]
+
+
+def _gw_fdr(p: PlayerSummary, gw: int) -> float:
+    legs = _gw_legs(p, gw)
+    if not legs:
+        return 5.0
+    return sum((f.directional_fdr if f.directional_fdr is not None else float(f.fdr)) for f in legs) / len(legs)
+
+
+def _concession_rate(p: PlayerSummary) -> float:
+    return p.xgc_per_90 if (p.xgc_per_90 > 0 and p.minutes >= 90) else _LEAGUE_AVG_GOALS_CONCEDED
+
+
+def structural_defensive_xp(p: PlayerSummary, gw: int) -> float | None:
     """
-    legs = [f for f in p.fixtures_next_3 if f.event == gw]
+    Points a DEF/GKP is in line for THIS gameweek, built from the scoring
+    rules rather than the model: the model has no position, clean-sheet or
+    saves feature, so its number for a defender is an attacker's number with
+    less xGI. None for outfield attackers (the model is fine for them).
+    Per leg: appearance 2, 4 × P(CS), -1 per 2 conceded (approximated on the
+    expected rate above one), goal involvements at ~5 each for a defender,
+    defensive contribution at 2 × P(threshold), saves at 1 per 3 for a
+    keeper, and a little bonus that follows clean sheets. Scaled by minutes
+    share so a rotation-risk defender isn't credited with a full game.
+    """
+    if p.position not in ("GKP", "DEF"):
+        return None
+    legs = _gw_legs(p, gw)
     if not legs:
         return 0.0
-
-    # Keepers and defenders live on clean sheets, which are close to binary and
-    # almost entirely opponent-driven — a defender away at the best team in the
-    # league is a different asset from the same defender at home to the worst.
-    # Attackers travel better: a premium forward scores against anyone, so his
-    # fixture matters but nothing like as much.
-    sensitivity = 0.16 if p.position in ("GKP", "DEF") else 0.10
-
     total = 0.0
     for f in legs:
-        fdr = f.directional_fdr if f.directional_fdr is not None else float(f.fdr)
-        # DEF: FDR 1 -> 1.32, 3 -> 1.0, 5 -> 0.68.  MID/FWD: 1.2 / 1.0 / 0.8.
-        total += max(0.5, min(1.4, 1.0 + (3.0 - fdr) * sensitivity))
-    return round(total, 3)
+        lam = _concession_rate(p) * _fixture_goal_factor(f)
+        p_cs = math.exp(-lam)
+        pts = 2.0 + 4.0 * p_cs - 0.5 * max(0.0, lam - 1.0) + 0.4 * p_cs
+        if p.position == "DEF":
+            pts += p.xgi_per_90 * 5.0 + 2.0 * _dc_hit_prob(p)
+        else:
+            pts += p.saves_per_90 / 3.0
+        total += pts
+    return round(total * _minutes_share(p, gw), 3)
 
 
-def apply_fixture_weighting(
+@dataclass
+class LineupPoints:
+    player: PlayerSummary
+    model_xp: float          # model's next-GW prediction (one leg)
+    structural_xp: float | None
+    legs: int                # fixtures this GW: 0 = blank, 2 = double
+    chance: float
+    points: float            # what the XI / captain / bench rank on
+
+
+def lineup_expected_points(
     players: list[PlayerSummary], predicted_points: dict[int, float], gw: int
-) -> dict[int, float]:
-    """Predicted points scaled by this gameweek's fixture — see gameweek_fixture_weight."""
-    return {
-        p.id: round(predicted_points.get(p.id, p.ep_next) * gameweek_fixture_weight(p, gw), 3)
-        for p in players
-    }
+) -> dict[int, LineupPoints]:
+    """
+    points = base × chance_of_playing, where base is the model's prediction
+    (already fixture-aware) times the number of legs this GW — 0 on a blank,
+    2 on a double — and, for DEF/GKP, blended half-and-half with the
+    structural clean-sheet estimate above.
+    """
+    out: dict[int, LineupPoints] = {}
+    for p in players:
+        legs = len(_gw_legs(p, gw))
+        model = float(predicted_points.get(p.id, p.ep_next) or 0.0)
+        struct = structural_defensive_xp(p, gw)
+        if legs == 0:
+            base = 0.0
+        else:
+            model_gw = model * legs
+            base = model_gw if struct is None else 0.5 * model_gw + 0.5 * struct
+        chance = _chance(p)
+        out[p.id] = LineupPoints(
+            player=p, model_xp=round(model, 3), structural_xp=struct, legs=legs,
+            chance=chance, points=round(base * chance, 3),
+        )
+    return out
 
+
+# ─────────────────────── Best XI ───────────────────────
 
 @dataclass
 class LineupSelection:
@@ -643,24 +709,30 @@ class LineupSelection:
     starting_expected_points: float
 
 
-def select_best_xi(squad_15: list[PlayerSummary], predicted_points: dict[int, float]) -> LineupSelection:
+_VALID_FORMATIONS = [
+    (d, m, 10 - d - m)
+    for d in range(3, 6)
+    for m in range(2, 6)
+    if 1 <= 10 - d - m <= 3
+]
+
+
+def select_best_xi(squad_15: list[PlayerSummary], points: dict[int, float]) -> LineupSelection:
     """
-    Deterministic best-XI selection — no LLM, and deliberately not folded
-    into the transfer debate. For a FIXED formation, the optimal XI is just
-    the top-N predicted-points players per position (points are additive
-    across players with no synergy term, so an exchange argument makes
-    top-N provably optimal within that formation). This brute-forces all 8
-    legal FPL formations and keeps whichever maximizes total predicted
-    points — cheap (8 sums over pre-sorted lists) and exact, not a heuristic.
+    Deterministic best-XI selection — no LLM. For a FIXED formation the
+    optimal XI is the top-N per position (points are additive, so an
+    exchange argument makes top-N provably optimal within the formation);
+    this brute-forces all 8 legal formations and keeps the best total.
+    `points` must already include availability (see lineup_expected_points).
     """
-    def _pred(p: PlayerSummary) -> float:
-        return predicted_points.get(p.id, p.ep_next)
+    def _pts(p: PlayerSummary) -> float:
+        return points.get(p.id, 0.0)
 
     by_pos: dict[str, list[PlayerSummary]] = {"GKP": [], "DEF": [], "MID": [], "FWD": []}
     for p in squad_15:
         by_pos.setdefault(p.position, []).append(p)
     for pos in by_pos:
-        by_pos[pos].sort(key=_pred, reverse=True)
+        by_pos[pos].sort(key=_pts, reverse=True)
 
     gk = by_pos["GKP"][:1]
     best: tuple[float, list[PlayerSummary], str] | None = None
@@ -668,17 +740,13 @@ def select_best_xi(squad_15: list[PlayerSummary], predicted_points: dict[int, fl
         if d > len(by_pos["DEF"]) or m > len(by_pos["MID"]) or f > len(by_pos["FWD"]):
             continue
         xi = gk + by_pos["DEF"][:d] + by_pos["MID"][:m] + by_pos["FWD"][:f]
-        total = sum(_pred(p) for p in xi)
+        total = sum(_pts(p) for p in xi)
         if best is None or total > best[0]:
             best = (total, xi, f"{d}-{m}-{f}")
 
     if best is None:
-        # Should be unreachable for a legal 2-5-5-3 squad, but degrade to
-        # "whatever's there" rather than crash the pipeline over a formation
-        # edge case (e.g. an incomplete squad mid-transfer-window).
         xi = squad_15[:11]
-        total = sum(_pred(p) for p in xi)
-        best = (total, xi, "unknown")
+        best = (sum(_pts(p) for p in xi), xi, "unknown")
 
     total, xi, formation = best
     starting_ids = {p.id for p in xi}
@@ -699,44 +767,47 @@ class CaptainPick:
     rationale: str
 
 
+def _captain_ceiling_bonus(p: PlayerSummary) -> float:
+    """Captaincy pays on variance, not the mean: the first-choice penalty
+    taker and the player with the most goal involvements per 90 have the
+    haul potential. +0.5 for pens, +2 per xGI/90 above 0.5."""
+    bonus = 0.5 if p.penalties_order == 1 else 0.0
+    bonus += max(0.0, p.xgi_per_90 - 0.5) * 2.0
+    return round(bonus, 3)
+
+
 def score_captain(
     xi: list[PlayerSummary],
-    predicted_points: dict[int, float],
+    points: dict[int, float],
+    gw: int,
     starts_pct_floor: float = 60.0,
 ) -> CaptainPick:
     """
-    Deterministic captain pick — no LLM debate, this is an argmax problem.
-    Score = predicted_points * chance_of_playing, restricted to nailed starters.
-    Fixture (directional FDR) is the tiebreak. Vice = runner-up.
+    Deterministic captain pick. Ranks on this gameweek's expected points
+    (availability included) plus a ceiling bonus, restricted to nailed
+    starters; this GW's directional FDR breaks ties. Vice = runner-up.
     """
-    def _weighted(p: PlayerSummary) -> float:
-        chance = (p.chance_of_playing_next_round if p.chance_of_playing_next_round is not None else 100) / 100.0
-        pred = predicted_points.get(p.id, p.ep_next)
-        return pred * chance
+    def _score(p: PlayerSummary) -> float:
+        base = points.get(p.id, 0.0)
+        return base + (_captain_ceiling_bonus(p) if base > 0 else 0.0)
 
-    # Rotation-risk filter. Falls back to the full XI if nobody clears the floor
-    # (e.g. early season when starts_pct is still low for everyone).
     pool = [p for p in xi if p.starts_pct >= starts_pct_floor] or list(xi)
-    ranked = sorted(
-        pool,
-        key=lambda p: (_weighted(p), -_avg_fdr(p.fixtures_next_3)),
-        reverse=True,
-    )
+    ranked = sorted(pool, key=lambda p: (_score(p), -_gw_fdr(p, gw)), reverse=True)
     top = ranked[0]
     runner_up = ranked[1] if len(ranked) > 1 else ranked[0]
 
+    chance_pct = int(round(_chance(top) * 100))
     rationale = (
-        f"{top.web_name}: {_weighted(top):.1f} weighted expected points "
-        f"({predicted_points.get(top.id, top.ep_next):.1f} pred x "
-        f"{(top.chance_of_playing_next_round or 100)}% chance), "
-        f"fixture FDR {_avg_fdr(top.fixtures_next_3):.1f}. "
-        f"Vice: {runner_up.web_name} ({_weighted(runner_up):.1f})."
+        f"{top.web_name}: {points.get(top.id, 0.0):.1f} expected points this GW "
+        f"({chance_pct}% chance of playing) + {_captain_ceiling_bonus(top):.1f} ceiling "
+        f"(pens/xGI), GW{gw} fixture FDR {_gw_fdr(top, gw):.1f}. "
+        f"Vice: {runner_up.web_name} ({points.get(runner_up.id, 0.0):.1f} + {_captain_ceiling_bonus(runner_up):.1f})."
     )
     return CaptainPick(
         player=top,
         vice=runner_up,
-        expected_points=_weighted(top),
-        vice_expected_points=_weighted(runner_up),
+        expected_points=round(_score(top), 3),
+        vice_expected_points=round(_score(runner_up), 3),
         rationale=rationale,
     )
 
@@ -744,38 +815,96 @@ def score_captain(
 @dataclass
 class BenchSlot:
     player: PlayerSummary
-    order: int  # 1 = first sub, ascending priority
+    order: int
     expected_points: float
+
+
+def _can_replace(sub: PlayerSummary, starter: PlayerSummary, counts: dict[str, int]) -> bool:
+    """FPL auto-sub legality: the sub comes on only if the resulting
+    formation still has 3-5 DEF, 2-5 MID, 1-3 FWD."""
+    if sub.position == "GKP" or starter.position == "GKP":
+        return sub.position == starter.position
+    if sub.position == starter.position:
+        return True
+    after = dict(counts)
+    after[starter.position] -= 1
+    after[sub.position] = after.get(sub.position, 0) + 1
+    return all(_FORMATION_MIN[pos] <= after.get(pos, 0) <= _FORMATION_MAX[pos] for pos in ("DEF", "MID", "FWD"))
 
 
 def order_bench(
     bench: list[PlayerSummary],
-    predicted_points: dict[int, float],
+    points: dict[int, float],
+    starting: list[PlayerSummary] | None = None,
 ) -> list[BenchSlot]:
     """
-    Deterministic bench order — sort by predicted points * playing-chance.
-    GKP always ranked first (FPL's own auto-sub rules require the bench
-    goalkeeper in the first bench slot — confirmed live: the /my-team/
-    endpoint rejects a payload with the bench GK anywhere else with
-    "Sub-position not allowed for element type"). Outfield subs fill the
-    remaining slots in priority order after that.
+    Bench order. GKP is always slot 1 (FPL rejects any other slot for the
+    bench keeper — verified live). Outfield slots are filled greedily by
+    expected points × the chance the sub is actually needed: the sum of the
+    miss-probabilities of the starters he could legally replace and that no
+    earlier sub already covers. With every starter fit that reduces to a
+    points sort with a tilt toward the sub who can cover the most positions.
     """
-    def _weighted(p: PlayerSummary) -> float:
-        chance = (p.chance_of_playing_next_round if p.chance_of_playing_next_round is not None else 100) / 100.0
-        pred = predicted_points.get(p.id, p.ep_next)
-        return pred * chance
-
-    outfield = sorted(
-        (p for p in bench if p.position != "GKP"),
-        key=_weighted,
-        reverse=True,
-    )
     gkp = [p for p in bench if p.position == "GKP"]
+    outfield = [p for p in bench if p.position != "GKP"]
+    starters = [p for p in (starting or []) if p.position != "GKP"]
+    counts = {pos: sum(1 for p in starters if p.position == pos) for pos in ("DEF", "MID", "FWD")}
+    miss = {p.id: max(_BASE_MISS_PROB, 1.0 - _chance(p)) for p in starters}
 
-    ordered = gkp + outfield
+    ordered: list[PlayerSummary] = []
+    covered: set[int] = set()
+    remaining = list(outfield)
+    while remaining:
+        def _value(sub: PlayerSummary) -> float:
+            if not starters:
+                return points.get(sub.id, 0.0)
+            coverage = sum(miss[s.id] for s in starters if s.id not in covered and _can_replace(sub, s, counts))
+            return points.get(sub.id, 0.0) * max(0.02, min(1.0, coverage))
+        pick = max(remaining, key=lambda p: (_value(p), points.get(p.id, 0.0)))
+        remaining.remove(pick)
+        ordered.append(pick)
+        covered |= {s.id for s in starters if _can_replace(pick, s, counts)}
+
     return [
-        BenchSlot(player=p, order=i + 1, expected_points=round(_weighted(p), 2))
-        for i, p in enumerate(ordered)
+        BenchSlot(player=p, order=i + 1, expected_points=round(points.get(p.id, 0.0), 2))
+        for i, p in enumerate(gkp + ordered)
     ]
 
 
+# ─────────────────────── One entry point ───────────────────────
+
+@dataclass
+class Lineup:
+    selection: LineupSelection
+    captain: CaptainPick
+    bench_order: list[BenchSlot]
+    points: dict[int, LineupPoints]
+    confidence: str
+    confidence_note: str
+
+
+def lineup_confidence(selection: LineupSelection, points: dict[int, LineupPoints]) -> tuple[str, str]:
+    """How settled the XI is: margin between the weakest outfield starter and
+    the best outfield bench option, and whether any starter carries a doubt."""
+    starters = [points[p.id] for p in selection.starting if p.position != "GKP" and p.id in points]
+    bench = [points[p.id] for p in selection.bench if p.position != "GKP" and p.id in points]
+    if not starters or not bench:
+        return "Medium", "incomplete squad data"
+    margin = min(s.points for s in starters) - max(b.points for b in bench)
+    doubts = [s.player.web_name for s in starters if s.chance < 1.0]
+    note = f"11th-vs-12th margin {margin:.1f} pts" + (f"; doubts: {', '.join(doubts)}" if doubts else "")
+    if margin >= 1.5 and not doubts:
+        return "High", note
+    if margin >= 0.5 and len(doubts) <= 1:
+        return "Medium", note
+    return "Low", note
+
+
+def build_lineup(players: list[PlayerSummary], predicted_points: dict[int, float], gw: int) -> Lineup:
+    lp = lineup_expected_points(players, predicted_points, gw)
+    pts = {pid: v.points for pid, v in lp.items()}
+    selection = select_best_xi(players, pts)
+    cap = score_captain(selection.starting, pts, gw)
+    bench = order_bench(selection.bench, pts, selection.starting)
+    conf, note = lineup_confidence(selection, lp)
+    return Lineup(selection=selection, captain=cap, bench_order=bench, points=lp, confidence=conf, confidence_note=note)

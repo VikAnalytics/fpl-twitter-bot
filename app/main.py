@@ -141,12 +141,10 @@ def _reconcile_lineup(manager_id: int, gw: int, my_team_picks: list[dict], run_i
         players, build_team_form(fixtures, gw), strength_lookup, team_id_by_name, gw
     )
 
-    # Same fixture weighting the pipeline used, or a reconcile would silently
+    # Same computation the pipeline used, or a reconcile would silently
     # produce a different XI than the one that was approved.
-    weighted = ranking.apply_fixture_weighting(players, preds, gw)
-    selection = ranking.select_best_xi(players, weighted)
-    cap = ranking.score_captain(selection.starting, weighted)
-    bench_order = ranking.order_bench(selection.bench, weighted)
+    lineup = ranking.build_lineup(players, preds, gw)
+    selection, cap, bench_order = lineup.selection, lineup.captain, lineup.bench_order
 
     cap_proposal = {
         "captain": cap.player.web_name, "captain_id": cap.player.id,
