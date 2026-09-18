@@ -2,189 +2,146 @@
 
 Two independent systems for Fantasy Premier League:
 
-1. **Autonomous multi-agent decision engine** — an ML model + a LangGraph multi-agent debate propose transfers, captain, and starting XI each gameweek; you approve or reject from Telegram; approved transfers execute automatically against your real FPL team. Deployed on Google Cloud Run, triggered by an external cron, backed by Turso.
-2. **Twitter news bot** (`bot.py`) — a separate, simpler script that tweets deadline reminders, DGW/BGW alerts, injury updates, and "Kings of the Gameweek." Runs on GitHub Actions, deliberately independent of the decision engine (own trigger, own dependency footprint, shares only the underlying Turso database for state).
+1. **Autonomous decision engine** — every gameweek, inside the last 12 hours before the deadline, a trained expected-points model, rule-based transfer scoring and a LangGraph multi-agent debate propose transfers, captain and starting XI. You approve or reject from Telegram; approved decisions execute against your real FPL team through FPL's OAuth-protected API. Runs on Google Cloud Run, triggered by an external cron, backed by Turso.
+2. **Twitter news bot** (`bot.py`) — a separate script that tweets deadline reminders, DGW/BGW alerts, injury updates and "Kings of the Gameweek". Runs on GitHub Actions and shares only the Turso database with the engine.
 
-See [`docs/architecture.md`](docs/architecture.md) for the full system design, [`docs/progress.md`](docs/progress.md) for build/verification status, and the `obsidian/` vault for the design-decision reasoning trail (open the folder as an Obsidian vault).
+`docs/` and `obsidian/` hold the design reasoning and are deliberately gitignored (local process notes). This README is the tracked description of how the thing works.
 
 ## Stack
 
 - Python 3.11, FastAPI, Jinja2
-- **Turso** (libSQL, SQLite-wire-compatible) for all state — decisions, conversations, pipeline observability, bot state
-- **LangGraph** + OpenAI `gpt-4o-mini` for the transfer debate (5 personas: analyst, fixture/form, news/injury, risk/scrutiny, moderator)
-- **scikit-learn** (`HistGradientBoostingRegressor`) for the expected-points model, trained on [vaastav/Fantasy-Premier-League](https://github.com/vaastav/Fantasy-Premier-League) historical data
-- OpenAI Responses API + `web_search` tool (`gpt-4.1-mini`) for real news search (press conferences, training reports, outlet coverage)
-- **Telegram Bot API** for approval (inline buttons) and hard escalation alerts
-- **Google Cloud Run** hosting, deployed via `gcloud run deploy --source .` (Cloud Build, no local Docker needed)
-- **cron-job.org** (external, free) triggers `/internal/tick` every 30 minutes — deliberately not GitHub Actions' `schedule:` trigger, which is known to be delayed/skipped under load
-- Twitter via `tweepy` for `bot.py`, triggered by `cron-job.org` dispatching a GitHub Actions workflow
+- **Turso** (libSQL over HTTPS) for all state — decisions, debate transcripts, candidates, calibration, pipeline observability, bot state
+- **scikit-learn** `HistGradientBoostingRegressor` for expected points, trained on [vaastav/Fantasy-Premier-League](https://github.com/vaastav/Fantasy-Premier-League) with labels recomputed from FPL's current scoring rules
+- **LangGraph** + OpenAI `gpt-4o-mini` for the transfer debate (analyst, fixture/form, news/injury, risk/scrutiny, rebuttal, moderator)
+- OpenAI Responses API + `web_search` on `gpt-4.1-mini` for one batched news search per run
+- **Telegram Bot API** for approvals (inline buttons) and escalation alerts
+- **Google Cloud Run** (`us-central1`), deployed automatically by GitHub Actions on every push to `main` that touches `app/`, `Dockerfile` or `requirements.txt`
+- **cron-job.org** POSTs `/internal/tick` every 30 minutes
+- Weekly model retrain on GitHub Actions (Tuesday 06:00 UTC); a promoted model is committed to `app/ml/` and that push triggers a deploy
 
 ## Project layout
 
 ```
 app/
-  main.py           FastAPI routes: home, decisions view, approve/reject,
-                     /internal/tick webhook, /telegram/webhook, /runs observability
-  fpl_client.py     FPL API calls, fixtures, team form/strength, replacements
-  fpl_auth.py       OAuth (PingOne) access-token refresh + transfer/lineup submission
-  ranking.py        Sell/buy scoring, best-XI selection, captain, bench order
-  llm.py            Shared LLM helpers for the debate: web search, grounded-target
-                     formatting, name resolution, transfer validation
-  notify.py         Telegram: escalation alerts + decision approval messages
-  observability.py  Structured per-run pipeline logging (step() context manager)
-  pricing.py        OpenAI token/call cost estimation
-  database.py       Turso-backed persistence (all tables)
-  models.py         Pydantic models
-  agents/           LangGraph transfer debate, XI/captain selection, evaluation,
-                     escalation checks, weekly pipeline orchestration
-  ml/               Feature engineering, model training, scoring-rules table,
-                     inference wrapper
-  templates/        Jinja views: /, /decisions, /runs
-bot.py              Twitter news bot (standalone, independent of app/agents/)
-docs/               Living architecture/plan/progress docs
-obsidian/           Design-decision reasoning trail (Obsidian vault)
-Dockerfile          Cloud Run build
+  main.py               FastAPI: /, /decisions/{id}, /runs, /runs/{run_id},
+                        /api/decisions/{id}/approve|reject, /telegram/webhook, /internal/tick
+  fpl_client.py         FPL API, fixtures, directional FDR, team form/strength, budget,
+                        replacement search
+  fpl_auth.py           PingOne OIDC refresh-token exchange, /my-team/, transfer + lineup submit
+  ranking.py            Sell/buy scoring, clean-sheet + defensive-contribution estimates,
+                        hit gate, lineup points, best XI, captain, bench order
+  llm.py                Debate context formatting, name resolution, transfer validation, news search
+  notify.py             Telegram approval messages + escalation
+  observability.py      step() context manager -> pipeline_log
+  pricing.py            OpenAI cost estimation
+  database.py           Turso persistence (6 tables)
+  models.py             Pydantic models (PlayerSummary, Fixture, BudgetInfo, ...)
+  agents/
+    pipeline.py         Weekly orchestration: data -> predictions -> sell/buy -> debate ->
+                        backstop -> projected squad -> lineup
+    graph.py            LangGraph debate + the precomputed FACTS table each proposal carries
+    personas.py         System prompts + structured-output schemas
+    evaluate.py         Post-gameweek scoring of every candidate + persona calibration
+    escalation_check.py Unapproved / unexecuted decision alerts
+  ml/
+    features.py         Feature schema (v4), clean-sheet probability, live feature builder
+    train.py            Training from vaastav CSVs, monotonic constraints, promotion gate
+    scoring_rules.py    FPL's current points table, validated to 0 mismatches on real rows
+    model.py            Inference wrapper, falls back to ep_next
+    model.pkl / model_meta.json
+  templates/            home, decisions, runs
+bot.py                  Twitter bot (independent)
+scripts/fpl_capture_refresh_token.py   one-off local login to seed the OAuth refresh token
+.github/workflows/      deploy_cloud_run.yml, train_model.yml, run_bot.yml
 ```
 
-## Autonomous decision engine
+## How a gameweek is decided
 
-Runs once per gameweek, close to the deadline (`DEBATE_WINDOW_HOURS = 12` in
-`app/agents/pipeline.py`) so the debate is grounded on fresh information:
+`POST /internal/tick` runs synchronously (Cloud Run only gives CPU during a request; the timeout is 1800s) and does three things: the weekly pipeline (once per gameweek, only within `DEBATE_WINDOW_HOURS = 12` of the deadline), the escalation check, and evaluation of the last finished gameweek. Every stage logs to `pipeline_log` under one `run_id`, visible at `/runs`.
 
-1. **Data + ML** — fetches your squad, fixtures, team form; runs every squad
-   player through the trained model (`app/ml/model.pkl`) for predicted points.
-   Falls back to FPL's own `ep_next` if no model is trained yet.
-2. **Real news search** — one batched web search (all squad + grounded-target
-   names, ~$0.03/run) via `gpt-4.1-mini` + `web_search`, covering press
-   conferences, training-ground reports, and outlet coverage — not just FPL's
-   own terse `news` field.
-3. **Transfer debate** (`app/agents/graph.py`) — LangGraph state machine:
-   analyst proposes → fixture/form and news/injury argue for/against →
-   risk/scrutiny challenges (looping for one extra round if the proposal
-   takes a point hit) → moderator decides. A deterministic backstop
-   (budget/position/club/hit-breakeven) re-validates the LLM's output before
-   anything reaches approval — the LLM never has unchecked authority.
-4. **Best XI + captain + bench** (`ranking.py`) — deterministic, no LLM debate
-   (near-argmax problems don't need one): `select_best_xi()` brute-forces all
-   8 legal FPL formations and keeps whichever maximizes total predicted
-   points, then captain/vice and bench order are derived from that XI.
-5. **Approval** — every decision (transfer, captain, lineup) is sent to
-   Telegram with inline Approve/Reject buttons. `/decisions/{manager_id}`
-   works as a secondary web surface. Unapproved decisions past deadline−3h,
-   or approved-but-unexecuted ones past deadline−1h, trigger a hard Telegram
-   escalation (`app/agents/escalation_check.py`).
-6. **Execution** — on approval, `app/fpl_auth.py` exchanges a stored OAuth
-   refresh token for a fresh access token (see "FPL authentication" below)
-   and submits via `x-api-authorization: Bearer <token>`. Captain/lineup
-   share one `/my-team/` call, so approving one waits for its sibling before
-   submitting the combined payload.
-7. **Feedback loop** — after the gameweek plays out, every candidate the
-   debate considered (not just the winner) is scored against actual points,
-   and each persona's stance is marked correct/incorrect — feeding a
-   calibration caveat into next week's debate.
+### 1. Data and budget
+Squad comes from FPL's picks endpoint for the *current* (locked) gameweek, since FPL 404s picks for the upcoming one; everything else targets the *next* gameweek. Free transfers and transfers made come from the authenticated `/my-team/` `transfers` block (FPL's own `limit` / `made`), with a derived fallback that no longer counts last week's transfers against this week.
 
-Every stage is logged to `pipeline_log` with duration, token usage, and cost —
-`GET /runs` and `GET /runs/{run_id}` surface the full trace for debugging a
-bad decision or a silent failure.
+### 2. Expected points
+`app/ml/model.pkl` predicts next-gameweek points for the squad and, later, every verified transfer target. Schema v4 features: form, team ppg and goal difference, opponent strength for this fixture, last-season points/90, xGI/90, xGC/90, next-3 directional FDR, starts%, FPL's `ep_next`, position one-hots, this fixture's clean-sheet probability, saves/90 and defensive contributions/90. Holdout MAE 1.96 against FPL's own `ep_next` at 2.60. `ep_next` is still the dominant feature.
 
-## Twitter bot (`bot.py`)
+### 3. Sell candidates and verified targets
+`ranking.score_sell` ranks all 15 (XI guaranteed 5 of 8 slots) on injury, form level and trend, `ep_next`, clean-sheet outlook for defenders, fixtures, minutes share and price momentum. For each candidate `find_valid_replacements` returns 8 affordable, same-position, different-club, not-recently-sold targets ranked by `ranking.score_buy`, which anchors on minutes-weighted xGI/90 for attackers and on expected clean-sheet points (Poisson on xGC/90 scaled by the fixture) plus defensive contributions for defenders, with `ep_next` at a reduced weight and the fixture swing against the outgoing player.
 
-Independent of the decision engine — own trigger, own minimal dependency set
-(`requests`, `tweepy`, `libsql-client`), shares only the Turso database for
-state (`bot_state` table).
+### 4. Debate
+One batched news search, then the LangGraph debate: analyst proposes up to the free-transfer count → fixture/form, news/injury and risk/scrutiny argue → an extra scrutiny round if a hit is involved → the analyst rebuts → the moderator decides at temperature 0. Each proposal carries a precomputed FACTS table (model xP, xGI/90, minutes share, next-3 FDR, clean-sheet outlook and record for defenders, `ep_next`, price) because gpt-4o-mini cannot be trusted to compare two numbers in prose. `is_hit` is stamped from the free-transfer count, not by the LLM.
 
-| Tweet | Trigger |
-|---|---|
-| ⏰ Deadline incoming | Next deadline ≤ 12h away, once per GW |
-| 🔥 DGW confirmed | Any team with 2+ fixtures in next event, once per GW |
-| 🚫 BGW incoming | Team missing from next event; guarded by deadline ≤ 7 days AND ≥ 7 fixtures present |
-| 🏥 Injury | Owned >5%, chance < 100%, status changed since last run |
-| ✅ Return | Previously flagged player now at 100% |
-| 👑 Kings of the Gameweek | Finished GW, top scorers from `/event/{id}/live/`, 💎 flags sub-5% differentials |
+### 5. Backstop
+The moderator's output is re-validated deterministically: names, position, club, budget, and for any move beyond the free count a breakeven gate (model xP delta × 3 gameweeks × 0.5 regression + fixture swing ≥ 4).
 
-**Silent resync**: if the bot has been dormant more than `RESYNC_GAP_HOURS`
-(6h, tracked via `last_run_at` in `bot_state`), the next run updates its
-injury-state baseline without tweeting the accumulated backlog — prevents a
-flood of stale "news" after a long gap (this happened for real: a broken
-cron-job.org → GitHub Actions dispatch job left it dormant for 3 months,
-and re-triggering it fired 7 tweets at once for changes that weren't
-actually new).
+### 6. Lineup
+`ranking.build_lineup` computes one number per player for this gameweek — model prediction × fixtures this week (0 on a blank, 2 on a double), blended 50/50 with a scoring-rules estimate for defenders and keepers, × chance of playing — and the XI (all 8 legal formations brute-forced), captain (plus a ceiling bonus for penalty takers and high xGI/90) and bench order (weighted by which starters each sub can legally replace under FPL's auto-sub rules) all rank on it. The XI is chosen for the squad the transfer would leave you with; picks are held until the transfer decision is terminal and reconciled against the live squad at submission.
 
-Triggered by `cron-job.org` calling the GitHub Actions dispatch API directly
-(`POST /repos/{owner}/{repo}/actions/workflows/run_bot.yml/dispatches`) —
-requires a token with `Actions: Read and write` permission for the repo.
+### 7. Approval, execution, feedback
+Every decision goes to Telegram with Approve/Reject buttons (`/decisions/{manager_id}` is the backup surface). Unapproved past deadline−3h or unexecuted past deadline−1h triggers an alert. Execution exchanges the stored OAuth refresh token for an access token and submits; captain and lineup share one `/my-team/` call so both must be approved first. After the gameweek, every candidate the debate considered is scored against actual points and each persona's stance marked right or wrong, feeding a calibration caveat into the next debate.
 
-## Deployment
+## Operations
 
-1. **Turso**: `turso db create <name>`, `turso db tokens create <name>`. Use
-   the `https://` URL scheme, not `libsql://` (the WebSocket/Hrana scheme
-   fails its handshake against a request/response server pattern).
-2. **Cloud Run**: `gcloud run deploy fpl-gaffer --source . --region <region> --allow-unauthenticated --set-env-vars <see below>`
-3. **cron-job.org**: a job hitting `POST https://<cloud-run-url>/internal/tick`
-   every 30 minutes with header `X-Cron-Secret: <CRON_SECRET>`.
-4. **Telegram webhook**: `GET https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<cloud-run-url>/telegram/webhook&secret_token=<TELEGRAM_WEBHOOK_SECRET>`
-5. **GitHub Actions secrets** (for `run_bot.yml` and `train_model.yml`):
-   `TWITTER_CONSUMER_KEY/SECRET`, `TWITTER_ACCESS_TOKEN/SECRET`,
-   `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`.
+**Rerun a gameweek after a code change.** The pipeline is idempotent per gameweek. Order matters: deploy first (wait for the workflow), then purge the gameweek from Turso in FK order (`persona_calibration`, `decision_candidates` by decision id; `agent_conversations`, `pipeline_log`, `agent_decisions` by gameweek), then trigger. The cron fires at :00 and :30, so a purge just before a boundary is picked up by the cron on whatever is deployed.
+
+```bash
+curl -X POST https://fpl-gaffer-283700541620.us-central1.run.app/internal/tick -H "X-Cron-Secret: $CRON_SECRET"
+```
+
+**Query production Turso.** Use the HTTP pipeline API rather than `libsql_client` from a local script: `POST $TURSO_DATABASE_URL/v2/pipeline` with `Authorization: Bearer $TURSO_AUTH_TOKEN` and `{"requests":[{"type":"execute","stmt":{"sql":"..."}},{"type":"close"}]}`. If you do use `libsql_client` in a script, call `db.close()` or the process never exits.
+
+**Local scripts and the production DB.** `app/main.py` calls `load_dotenv()` on import, so pop `TURSO_DATABASE_URL` *after* importing it and assert `db._client is None` before touching the DB, or your test writes go to production.
 
 ## FPL authentication
 
-FPL migrated login to PingOne (OAuth2/OIDC) — the old email+password form
-POST to `users.premierleague.com` no longer resolves at all. There's no way
-to script a login against it anymore (nor should there be — PingOne's login
-page is explicitly guarded against bot traffic), so a **real human login,
-once**, is required to bootstrap execution:
+FPL login is PingOne OIDC. Log in once yourself:
 
 ```bash
-pip install playwright
-playwright install chromium
+pip install playwright && playwright install chromium
 python scripts/fpl_capture_refresh_token.py
 ```
 
-A real browser window opens; log in yourself. The script reads the resulting
-OAuth refresh token out of the browser's own session storage (FPL's site
-already requests `offline_access` scope for its own silent token renewal —
-this just reads what it already stores) and saves it to Turso. From then on,
-`app/fpl_auth.py` silently exchanges it for a fresh ~8-hour access token
-before every execution — no browser, no password, no human, fully
-unattended — until the refresh token itself is eventually revoked or
-expires, at which point re-run the script above.
-
-Playwright is **not** a production dependency — it's only needed for this
-one-off local script, so the Cloud Run image stays small.
+The script reads the refresh token FPL's own site stores in `localStorage` and saves it to Turso. `app/fpl_auth.py` exchanges it for a fresh ~8h access token before every execution (PingOne rotates the refresh token on each use; the new one is persisted). Playwright is not a production dependency.
 
 ## Running locally
 
 ```bash
-python -m venv venv
-source venv/bin/activate
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
 # .env
 OPENAI_API_KEY=...
 FPL_MANAGER_ID=...
-TURSO_DATABASE_URL=...     # https:// scheme — omit to fall back to a local SQLite file (dev only)
+TURSO_DATABASE_URL=https://...   # omit to use a local SQLite file (dev only)
 TURSO_AUTH_TOKEN=...
-CRON_SECRET=...            # shared secret for /internal/tick
+CRON_SECRET=...
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
 TELEGRAM_WEBHOOK_SECRET=...
-# for bot.py (optional — dry-run without these):
-TWITTER_CONSUMER_KEY=...
-TWITTER_CONSUMER_SECRET=...
-TWITTER_ACCESS_TOKEN=...
-TWITTER_ACCESS_TOKEN_SECRET=...
+TWITTER_*=...                     # bot.py only; dry-run without them
 
 uvicorn app.main:app --reload
-python bot.py                              # dry-run if Twitter creds missing
-python -m app.agents.pipeline --dry-run    # preview the debate context without running it
-python -m app.agents.pipeline --force      # run the full pipeline regardless of deadline window
-python -m app.ml.train                     # (re)train the expected-points model
+python -m app.agents.pipeline --dry-run    # builds the debate context, no LLM calls
+python -m app.agents.pipeline --force      # full run regardless of the deadline window
+python -m app.ml.train                     # retrain (gated unless the feature schema changed)
+python bot.py
 ```
+
+## Twitter bot (`bot.py`)
+
+| Tweet | Trigger |
+|---|---|
+| ⏰ Deadline incoming | Next deadline ≤ 12h away, once per GW |
+| 🔥 DGW confirmed | Any team with 2+ fixtures in next event |
+| 🚫 BGW incoming | Team missing from next event (guarded) |
+| 🏥 Injury / ✅ Return | Owned >5%, chance changed since last run |
+| 👑 Kings of the Gameweek | Finished GW top scorers, 💎 for sub-5% owned |
+
+If dormant more than `RESYNC_GAP_HOURS` (6h) it resyncs its injury baseline silently instead of tweeting the backlog. Triggered by cron-job.org dispatching `run_bot.yml`.
 
 ## Configuration
 
-- Bootstrap/fixtures in-memory cache: 5 minutes
 - Debate window: 12h before deadline (`DEBATE_WINDOW_HOURS`)
-- Approval cutoff: deadline−3h; failsafe alert: deadline−1h (`app/agents/escalation_check.py`)
-- bot.py resync threshold: 6h (`RESYNC_GAP_HOURS`)
+- Approval cutoff alert: deadline−3h; failsafe: deadline−1h
+- Bootstrap/fixtures cache: 5 minutes
+- Model retrain: Tuesday 06:00 UTC, promotion gate 5% MAE tolerance, skipped when `FEATURE_SCHEMA_VERSION` changes
