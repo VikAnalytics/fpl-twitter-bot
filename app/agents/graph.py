@@ -49,6 +49,7 @@ from .personas import (
     ModeratorDecision,
     RiskScrutinyOutput,
 )
+from ..ranking import _avg_fdr
 from .state import DebateState
 
 _MODEL_NAME = "gpt-4o-mini"
@@ -98,18 +99,34 @@ def _proposal_block(state: DebateState) -> str:
         if not out_p or not in_p:
             continue
 
-        def _avg(p):
-            return sum(p.recent_form_5gw) / len(p.recent_form_5gw) if p.recent_form_5gw else 0.0
-
+        # ep_next and "pts/GW so far" used to sit side by side, but early
+        # season they are the same number (FPL's ep_next IS points-per-game
+        # until form exists), so the agents saw one fact twice and treated it
+        # as corroboration. The table now leads with the model's forward
+        # projection and the independent evidence (threat, minutes, next-3
+        # fixtures); ep_next stays as one line, labelled for what it is.
+        preds = state["context"].get("predictions", {})
+        pred_out, pred_in = preds.get(out_p.id), preds.get(in_p.id)
+        fdr_out, fdr_in = _avg_fdr(out_p.fixtures_next_3), _avg_fdr(in_p.fixtures_next_3)
+        gws_played = max(gw - 1, 1)
+        mins_out = min(100.0, out_p.minutes / (gws_played * 0.9))
+        mins_in = min(100.0, in_p.minutes / (gws_played * 0.9))
+        model_line = (
+            f"      model xP (next GW, fixture-adjusted): OUT {pred_out:.2f} vs IN {pred_in:.2f}  "
+            f"(delta {pred_in - pred_out:+.2f} in favour of {'IN' if pred_in > pred_out else 'OUT'})\n"
+            if pred_out is not None and pred_in is not None else ""
+        )
         lines.append(
             "    FACTS (authoritative — use these numbers, do not restate your own):\n"
-            f"      ep_next:      OUT {out_p.ep_next} vs IN {in_p.ep_next}  "
-            f"(delta {in_p.ep_next - out_p.ep_next:+.2f} in favour of {'IN' if in_p.ep_next > out_p.ep_next else 'OUT'})\n"
-            f"      pts/GW so far: OUT {_avg(out_p):.2f} vs IN {_avg(in_p):.2f}  (delta {_avg(in_p) - _avg(out_p):+.2f})\n"
-            f"      xGI/90:       OUT {out_p.xgi_per_90:.2f} vs IN {in_p.xgi_per_90:.2f}  "
+            + model_line
+            + f"      xGI/90:       OUT {out_p.xgi_per_90:.2f} vs IN {in_p.xgi_per_90:.2f}  "
             f"(delta {in_p.xgi_per_90 - out_p.xgi_per_90:+.2f})\n"
-            f"      starts%:      OUT {out_p.starts_pct:.0f}% vs IN {in_p.starts_pct:.0f}%\n"
+            f"      minutes share: OUT {mins_out:.0f}% vs IN {mins_in:.0f}%  (starts OUT {out_p.starts_pct:.0f}% vs IN {in_p.starts_pct:.0f}%)\n"
+            f"      next-3 avg FDR (lower = easier): OUT {fdr_out:.2f} vs IN {fdr_in:.2f}  "
+            f"(swing {fdr_out - fdr_in:+.2f} in favour of {'IN' if fdr_in < fdr_out else 'OUT'})\n"
             f"      GW{gw} fixture: OUT {_fixture_for(out_p, gw)} vs IN {_fixture_for(in_p, gw)}\n"
+            f"      FPL ep_next (backward-looking form estimate): OUT {out_p.ep_next} vs IN {in_p.ep_next}  "
+            f"(delta {in_p.ep_next - out_p.ep_next:+.2f})\n"
             f"      price:        OUT £{out_p.now_cost}m vs IN £{in_p.now_cost}m"
         )
     return "\n".join(lines)

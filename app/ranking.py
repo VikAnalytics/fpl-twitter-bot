@@ -30,6 +30,12 @@ def season_phase(gw: int) -> Phase:
     return "MID"
 
 
+def _ep_weight(phase: Phase) -> float:
+    """Multiplier on FPL's ep_next in score_buy. Early season ep_next is just
+    points-per-game over 2-4 samples, so it gets the least say."""
+    return 1.0 if phase == "EARLY" else 2.0
+
+
 def _phase_weights(phase: Phase) -> dict[str, float]:
     """Signal weight multipliers per phase."""
     if phase == "EARLY":
@@ -295,8 +301,31 @@ def score_buy_report(c: PlayerSummary, vs_sold: PlayerSummary, gw: int = 20) -> 
     flags: list[str] = []
     signals: list[str] = []
 
-    # 1. ep_next — anchor
-    score += c.ep_next * 5
+    # 1. ep_next — a baseline, no longer THE anchor. At ×5 it outranked every
+    #    other signal combined (Bogle 46 vs a +18 fixture band), and FPL's
+    #    ep_next is backward-looking: for GW1-5 it is literally points-per-game
+    #    on a handful of samples, later it is form with a mild fixture tweak.
+    #    The same number then reappeared in the sell score, the FACTS table,
+    #    the breakeven gate and the ML model, so the debate had one column of
+    #    evidence in five costumes. Early season it is shrunk further.
+    score += c.ep_next * _ep_weight(phase)
+
+    # 1b. Underlying threat, minutes-weighted — the forward-looking anchor.
+    #     xGI/90 says what a player creates when on the pitch; minutes share
+    #     says how much pitch he gets. Elite attacker (0.8 xGI/90, every
+    #     minute) ≈ +20 at neutral weight, a rotation-risk defender ≈ +2.
+    minutes_share = min(1.0, c.minutes / (max(gw - 1, 1) * 90.0)) if gw > 1 else (c.starts_pct / 100.0)
+    threat = c.xgi_per_90 * minutes_share * 25 * w["underlying"]
+    if threat >= 12:
+        signals.append(f"threat {c.xgi_per_90:.2f} xGI/90 at {minutes_share * 100:.0f}% mins")
+    score += threat
+
+    # 1c. Fixture swing vs the player being sold, over the next 3 — the
+    #     comparison that actually matters for a swap, independent of ep_next.
+    fixture_swing = (_avg_fdr(vs_sold.fixtures_next_3) - _avg_fdr(c.fixtures_next_3)) * 4
+    if abs(fixture_swing) >= 3:
+        signals.append(f"fixture swing {fixture_swing:+.1f} vs outgoing")
+    score += fixture_swing
 
     # 2. Form trend
     trend = form_trend(c.recent_form_5gw)
@@ -363,15 +392,16 @@ def score_buy_report(c: PlayerSummary, vs_sold: PlayerSummary, gw: int = 20) -> 
         signals.append("Mass transfers in")
         score += 4
 
-    # 8. Value vs sold — prefer not a pure downgrade
+    # 8. Value vs sold — prefer not a pure downgrade. Halved: ep_next already
+    #    counts once in (1), this is the second time.
     value_delta = (c.ep_next - vs_sold.ep_next)
     if value_delta > 1.0:
         signals.append(f"+{value_delta:.1f} ep_next vs outgoing")
-        score += 12
+        score += 6
     elif value_delta > 0.3:
-        score += 5
+        score += 3
     elif value_delta < -0.5:
-        score -= 8
+        score -= 4
 
     # 9. Role similarity (xGI axis) — penalize drastic role mismatch for DEF/MID
     if vs_sold.position in ("DEF", "MID") and vs_sold.role_score > 0.2:
@@ -424,17 +454,29 @@ def hit_breakeven_ok(
     buy_report: BuyReport,
     sell_report: SellReport,
     hit_cost: int = 4,
+    pred_in: float | None = None,
+    pred_out: float | None = None,
+    horizon_gws: int = 3,
+    regression: float = 0.5,
 ) -> bool:
     """
-    Rough expected gain over hit cost.
-    gain ≈ (buy.ep_next - sell.ep_next) + fixture_swing + form_swing
+    Does a -4 pay for itself over the next `horizon_gws`?
+
+    Per-GW edge comes from the expected-points model when both sides have a
+    prediction (it already folds in next-3 FDR, minutes and opponent), else
+    from FPL's ep_next. It is then extended over the horizon and halved,
+    because a single-GW edge measured on the incoming player's hot streak
+    regresses — the old gate (1 × ep delta + fixture swing ≥ 4) waved through
+    anything with a big ep_next and nothing else.
     """
-    ep_gain = buy_report.player.ep_next - sell_report.player.ep_next
-    # fixture swing over 3 GWs: (sell_fdr - buy_fdr) * 0.5pts/fdr ≈ rough heuristic
+    if pred_in is not None and pred_out is not None:
+        per_gw = pred_in - pred_out
+    else:
+        per_gw = buy_report.player.ep_next - sell_report.player.ep_next
     sell_fdr = _avg_fdr(sell_report.player.fixtures_next_3)
     buy_fdr = _avg_fdr(buy_report.player.fixtures_next_3)
-    fixture_swing = (sell_fdr - buy_fdr) * 1.5  # 3 GW cumulative
-    total_gain = ep_gain + fixture_swing
+    fixture_swing = (sell_fdr - buy_fdr) * 0.5 * horizon_gws  # ~0.5 pt per FDR step per GW
+    total_gain = per_gw * horizon_gws * regression + fixture_swing
     return total_gain >= hit_cost
 
 

@@ -58,6 +58,7 @@ def _format_grounded_targets(
     grounded_targets: dict[str, list[PlayerSummary]],
     sell_by_name: dict[str, PlayerSummary],
     gw: int,
+    predictions: dict[int, float] | None = None,
 ) -> str:
     if not grounded_targets:
         return ""
@@ -71,8 +72,9 @@ def _format_grounded_targets(
             form_str = "→".join(str(x) for x in t.recent_form_5gw) if t.recent_form_5gw else "N/A"
             flag_str = ", ".join(report.flags) if (report and report.flags) else ""
             lines.append(
-                f"    • {t.web_name} ({t.team_name}) £{t.now_cost}m | score {report.score:.1f} | "
-                f"ep_next:{t.ep_next} | form:{t.form} | 5GW:{form_str}\n"
+                f"    • {t.web_name} ({t.team_name}) £{t.now_cost}m | score {report.score:.1f}"
+                + (f" | model xP:{predictions[t.id]:.2f}" if predictions and t.id in predictions else "")
+                + f" | ep_next:{t.ep_next} | form:{t.form} | 5GW:{form_str}\n"
                 f"      xGI/90 {t.xgi_per_90:.2f} | Starts {t.starts_pct:.0f}% | "
                 f"{'PEN1' if t.penalties_order == 1 else ''}"
                 f"{' DFK' + str(t.direct_freekicks_order) if t.direct_freekicks_order and t.direct_freekicks_order <= 2 else ''}"

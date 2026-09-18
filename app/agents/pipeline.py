@@ -21,6 +21,7 @@ app/agents/escalation_check.py).
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import datetime
 import os
 import sys
@@ -69,6 +70,8 @@ def _predicted_points_for(players, team_form_lookup, strength_lookup, team_id_by
     app/ml/features.opponent_strength, which both this and training now use.
     """
     inputs, ids = [], []
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        history_by_id = dict(zip([p.id for p in players], pool.map(fetch_player_history_past, [p.id for p in players])))
     for p in players:
         team_id = team_id_by_name.get(p.team_name)
         tf = team_form_lookup.get(team_id, {})
@@ -79,7 +82,7 @@ def _predicted_points_for(players, team_form_lookup, strength_lookup, team_id_by
         opp_strength_val = (
             opponent_strength(strength_lookup.get(fixture.opp_id), fixture.venue) if fixture else 3.0
         )
-        history_past = fetch_player_history_past(p.id)
+        history_past = history_by_id.get(p.id, [])
         inputs.append(build_live_inputs(p, tf, opp_strength_val, history_past))
         ids.append(p.id)
     preds = ml_model.predict_points(inputs)
@@ -110,7 +113,10 @@ def _fetch_news_context(squad, grounded_targets: dict, gw: int, run_id: str) -> 
         return text
 
 
-def build_transfer_context(squad, sell_reports, grounded_targets, budget, gw, calibration_caveat: str, run_id: str) -> dict:
+def build_transfer_context(
+    squad, sell_reports, grounded_targets, budget, gw, calibration_caveat: str, run_id: str,
+    predictions: dict[int, float] | None = None,
+) -> dict:
     sell_by_name = {r.player.web_name: r.player for r in sell_reports}
     squad_by_name_lc = {r.player.web_name.lower(): r.player for r in sell_reports}
     player_index = dict(squad_by_name_lc)
@@ -125,7 +131,7 @@ def build_transfer_context(squad, sell_reports, grounded_targets, budget, gw, ca
         f"BUDGET: ITB £{budget.itb}m | Free transfers: {budget.free_transfers} | "
         f"Transfers already made this GW: {budget.transfers_made}\n\n"
         f"SELL CANDIDATES (ranked by urgency):\n{llm_module._sell_candidates_str(sell_reports)}\n\n"
-        f"{llm_module._format_grounded_targets(grounded_targets, sell_by_name, gw)}\n\n"
+        f"{llm_module._format_grounded_targets(grounded_targets, sell_by_name, gw, predictions)}\n\n"
         + (f"LATEST NEWS (web search — press conferences, training reports, outlet coverage):\n{news_context}\n\n" if news_context else "")
         + "RULES: Only propose sells from SELL CANDIDATES. Only propose buys from that "
         "sell's VERIFIED TRANSFER TARGETS.\n"
@@ -147,7 +153,21 @@ def build_transfer_context(squad, sell_reports, grounded_targets, budget, gw, ca
         "grounded_targets": grounded_targets,
         "budget_itb": budget.itb,
         "free_transfers": budget.free_transfers,
+        # player_id -> model expected points next GW, squad AND targets, so the
+        # FACTS table and the hit gate compare like with like instead of ep_next.
+        # Scaled by chance_of_playing here (not in the model, where the feature
+        # is a training-time constant): an injured player projected at 2.99
+        # made a free swap look like a +4.9 when it is really a +7.9.
+        "predictions": _availability_adjusted(predictions or {}, player_index),
     }
+
+
+def _availability_adjusted(predictions: dict[int, float], player_index: dict) -> dict[int, float]:
+    chance_by_id = {}
+    for p in player_index.values():
+        c = p.chance_of_playing_next_round
+        chance_by_id[p.id] = (100 if c is None else c) / 100.0
+    return {pid: round(pred * chance_by_id.get(pid, 1.0), 2) for pid, pred in predictions.items()}
 
 
 def run_transfer_debate(
@@ -206,7 +226,10 @@ def run_transfer_debate(
                 if len(validated_transfers) >= context["free_transfers"]:
                     sell_report = next((r for r in sell_reports if r.player.id == out_p.id), None)
                     buy_report = ranking.score_buy_report(in_p, out_p, gw)
-                    if sell_report and not ranking.hit_breakeven_ok(buy_report, sell_report):
+                    preds = context.get("predictions", {})
+                    if sell_report and not ranking.hit_breakeven_ok(
+                        buy_report, sell_report, pred_in=preds.get(in_p.id), pred_out=preds.get(out_p.id),
+                    ):
                         db.log_agent_message(
                             decision_id, gw, final_state["round"], "backstop",
                             f"REJECTED {out_p.web_name}->{in_p.web_name}: hit not breakeven-profitable per deterministic check.",
@@ -538,8 +561,26 @@ def run_weekly_pipeline(manager_id: int, dry_run: bool = False, force: bool = Fa
                 grounded_targets[sell_p.web_name] = replacements
         ctx["detail"] = {sell_name: [t.web_name for t in targets] for sell_name, targets in grounded_targets.items()}
 
+    # Model projections for every verified target, so the debate sees a
+    # forward-looking number per player rather than only FPL's ep_next.
+    with observability.step(run_id, "pipeline.ml_predict_targets", gameweek=gw, manager_id=manager_id) as ctx:
+        squad_ids = {pk.player.id for pk in squad}
+        targets_by_id = {t.id: t for ts in grounded_targets.values() for t in ts if t.id not in squad_ids}
+        player_predictions.update(
+            _predicted_points_for(list(targets_by_id.values()), team_form_lookup, strength_lookup, team_id_by_name, gw)
+        )
+        ctx["detail"] = {
+            "targets_predicted": len(targets_by_id),
+            "predictions": [
+                {"player_id": pid, "player_name": t.web_name, "predicted_points": player_predictions.get(pid), "ep_next": t.ep_next}
+                for pid, t in targets_by_id.items()
+            ],
+        }
+
     calibration_caveat = build_calibration_context()
-    context = build_transfer_context(squad, sell_reports, grounded_targets, budget, gw, calibration_caveat, run_id)
+    context = build_transfer_context(
+        squad, sell_reports, grounded_targets, budget, gw, calibration_caveat, run_id, predictions=player_predictions,
+    )
 
     if dry_run:
         return {"dry_run": True, "gameweek": gw, "run_id": run_id, "context_preview": context["prompt_text"][:2000]}
