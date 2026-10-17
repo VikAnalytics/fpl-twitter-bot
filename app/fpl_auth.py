@@ -158,8 +158,9 @@ def submit_transfers(
     transfers: list[dict],  # [{"element_in": id, "element_out": id, "purchase_price": int, "selling_price": int}]
     retries: int = 3,
     backoff_seconds: int = 15,
+    chip: str | None = None,
 ) -> dict:
-    payload = {"chip": None, "entry": manager_id, "event": gameweek, "transfers": transfers}
+    payload = {"chip": chip, "entry": manager_id, "event": gameweek, "transfers": transfers}
     return _post_with_retry(f"{FPL_BASE}/transfers/", payload, access_token, retries, backoff_seconds)
 
 

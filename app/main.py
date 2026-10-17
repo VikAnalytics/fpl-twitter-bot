@@ -60,9 +60,18 @@ def _execute_transfer_decision(decision: dict, run_id: str) -> dict:
     except (FplAuthError, Exception) as e:  # noqa: BLE001 — surfaced to caller for escalation
         return {"ok": False, "error": str(e)}
 
+    # Under an active wildcard / free hit, a proposal flagged `wildcard` is the
+    # rebuild itself: submit it with the chip named, so FPL either treats the
+    # moves as free or rejects the request outright (no transfers made) —
+    # never `"chip": None`, which risks being charged as ordinary transfers.
+    # Any other proposal made before the chip was played is stale.
     chip = active_chip(my_team)
+    transfer_chip = None
     if chip:
-        return {"ok": False, "chip": chip, "error": f"{chip} active — transfer proposal is stale"}
+        if decision["proposal"].get("wildcard") and chip in ("wildcard", "freehit"):
+            transfer_chip = chip
+        else:
+            return {"ok": False, "chip": chip, "error": f"{chip} active — transfer proposal is stale"}
 
     selling_price_by_id = {p["element"]: p.get("selling_price") for p in my_team.get("picks", [])}
 
@@ -78,7 +87,7 @@ def _execute_transfer_decision(decision: dict, run_id: str) -> dict:
         })
 
     with observability.step(run_id, "execution.submit_transfers", gameweek=gw, manager_id=manager_id, decision_id=decision["id"]) as ctx:
-        result = submit_transfers(access_token, manager_id, gw, payload)
+        result = submit_transfers(access_token, manager_id, gw, payload, chip=transfer_chip)
         ctx["detail"] = {"payload": payload, "result": result}
     return result
 
