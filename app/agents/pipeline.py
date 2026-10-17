@@ -499,16 +499,22 @@ def run_weekly_pipeline(manager_id: int, dry_run: bool = False, force: bool = Fa
             "gw_picks": gw_picks, "gw_target": gw,
         }
 
-    # A null transfer limit means a wildcard or free hit is switched on for gw:
-    # the manager rebuilt the squad by hand. There is no transfer to propose,
+    # A wildcard or free hit switched on for gw means the manager rebuilt the
+    # squad by hand. There is no transfer to propose,
     # and the public picks above are LAST gameweek's squad — so pick the XI and
     # captain for the squad /my-team/ holds now. A no-op transfer decision is
     # recorded as executed, so the per-gameweek idempotency guard holds and
     # the picks aren't parked behind a transfer that will never resolve.
-    if my_team_transfers is not None and "limit" in my_team_transfers and my_team_transfers["limit"] is None:
+    # FPL shows a confirmed wildcard as chip status "active" with the transfer
+    # limit still 1 — checking the limit alone missed GW7 2026-27.
+    from ..fpl_auth import active_chip, fetch_my_team, get_access_token
+    try:
+        my_team = fetch_my_team(get_access_token(), manager_id)
+    except Exception:  # noqa: BLE001 — no auth means no chip check, decide as before
+        my_team = None
+    chip = active_chip(my_team) if my_team else None
+    if chip in ("wildcard", "freehit", "wildcard_or_freehit"):
         with observability.step(run_id, "pipeline.chip_squad", gameweek=gw, manager_id=manager_id) as ctx:
-            from ..fpl_auth import fetch_my_team, get_access_token
-            my_team = fetch_my_team(get_access_token(), manager_id)
             raw_picks = [
                 {
                     "element": p["element"], "position": p["position"], "multiplier": p.get("multiplier", 1),
@@ -524,7 +530,7 @@ def run_weekly_pipeline(manager_id: int, dry_run: bool = False, force: bool = Fa
                 [p.player for p in squad], team_form_lookup, strength_lookup, team_id_by_name, gw
             )
             ctx["detail"] = {
-                "reason": "wildcard_or_freehit_active",
+                "reason": f"{chip}_active",
                 "squad": [pk.player.web_name for pk in squad],
                 "predictions": {pk.player.web_name: player_predictions.get(pk.player.id) for pk in squad},
             }
@@ -538,7 +544,7 @@ def run_weekly_pipeline(manager_id: int, dry_run: bool = False, force: bool = Fa
             manager_id, gw, squad, player_predictions, run_id, assumes_transfer_id=transfer_id,
         )
         return {
-            "gameweek": gw, "run_id": run_id, "chip": "wildcard_or_freehit",
+            "gameweek": gw, "run_id": run_id, "chip": chip,
             "transfer": {"decision_id": transfer_id, **noop},
             "captain": captain_decision, "lineup": lineup_decision,
         }
