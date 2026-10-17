@@ -133,12 +133,26 @@ def build_live_inputs(
         fixture.directional_fdr if fixture else None, float(fixture.fdr) if fixture else 3.0,
     )
 
+    # Training's `form` is the mean of the last 5 gameweeks' points. FPL's own
+    # `form` is a 30-day window, which an international break collapses to one
+    # or two matches — GW6 2026-27 had Groß at 15.5 and B.Fernandes at 2.0 off
+    # GW4-5 alone. FPL's ep_next is then often that same number, and the model
+    # leans on ep_next ~7x harder than on form, so a two-game hot streak
+    # outranked every premium. Use the training definition when we have it, and
+    # treat an ep_next that merely echoes FPL's form as that form too.
+    form = player.form
+    ep_next = player.ep_next
+    if player.recent_form_5gw:
+        form = sum(player.recent_form_5gw) / len(player.recent_form_5gw)
+        if player.ep_next == player.form:
+            ep_next = form
+
     return {
         **position_one_hot(player.position),
         "cs_prob_gw": cs_prob,
         "saves_per_90": player.saves_per_90,
         "dc_per_90": player.dc_per_90,
-        "form": player.form,
+        "form": form,
         "team_ppg": team_form.get("points_per_game", 1.0) if team_form else 1.0,
         "team_gd_pg": team_form.get("goal_diff_per_game", 0.0) if team_form else 0.0,
         "opponent_strength": opponent_strength_value,
@@ -148,5 +162,5 @@ def build_live_inputs(
         "xgc_per_90": player.xgc_per_90,
         "avg_fdr": avg_fdr,
         "starts_pct": player.starts_pct,
-        "ep_next": player.ep_next,
+        "ep_next": ep_next,
     }

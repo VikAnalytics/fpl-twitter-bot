@@ -19,7 +19,7 @@ from .database import (
     get_run_log, get_recent_runs,
 )
 from . import observability
-from .fpl_auth import FplAuthError, fetch_my_team, get_access_token, set_lineup, submit_transfers
+from .fpl_auth import FplAuthError, active_chip, fetch_my_team, get_access_token, set_lineup, submit_transfers
 from .notify import answer_telegram_callback, escalate_execution_failure, send_telegram_alert
 from .fpl_client import (
     build_player_lookup,
@@ -59,6 +59,10 @@ def _execute_transfer_decision(decision: dict, run_id: str) -> dict:
             my_team = fetch_my_team(access_token, manager_id)
     except (FplAuthError, Exception) as e:  # noqa: BLE001 — surfaced to caller for escalation
         return {"ok": False, "error": str(e)}
+
+    chip = active_chip(my_team)
+    if chip:
+        return {"ok": False, "chip": chip, "error": f"{chip} active — transfer proposal is stale"}
 
     selling_price_by_id = {p["element"]: p.get("selling_price") for p in my_team.get("picks", [])}
 
@@ -169,6 +173,13 @@ def _execute_lineup_decisions(captain_decision: dict, lineup_decision: dict, run
     except (FplAuthError, Exception) as e:  # noqa: BLE001
         return {"ok": False, "error": str(e)}
 
+    # A wildcard / free hit is fine here — it can't be cancelled once confirmed,
+    # and the reconcile below rebuilds the XI if the squad differs. A bench
+    # boost or triple captain CAN be switched off, and set_lineup sends
+    # `"chip": None` by default, so pass it through to keep it on.
+    chip = active_chip(my_team)
+    lineup_chip = chip if chip in ("bboost", "3xc") else None
+
     # The XI was chosen before the transfer resolved. Check it against the squad
     # FPL holds right now and recompute if they've diverged, rather than submit
     # element ids that are no longer in the squad.
@@ -194,8 +205,8 @@ def _execute_lineup_decisions(captain_decision: dict, lineup_decision: dict, run
 
     with observability.step(run_id, "execution.set_lineup", gameweek=gw, manager_id=manager_id) as ctx:
         picks = _build_lineup_payload(captain_decision, lineup_decision)
-        result = set_lineup(access_token, manager_id, picks)
-        ctx["detail"] = {"picks": picks, "result": result, "reconciled": reconciled}
+        result = set_lineup(access_token, manager_id, picks, chip=lineup_chip)
+        ctx["detail"] = {"picks": picks, "result": result, "reconciled": reconciled, "chip": chip}
 
     if reconciled and result.get("ok"):
         # Never silently diverge from what was approved.
@@ -283,7 +294,10 @@ def _execute_decision(decision_id: int) -> None:
 
     if decision["decision_type"] == "transfer":
         result = _execute_transfer_decision(decision, run_id)
-        if result.get("ok"):
+        if result.get("chip"):
+            set_decision_status(decision_id, "rejected")
+            send_telegram_alert(f"🃏 GW{decision['gameweek']} {result['chip']} active — transfer #{decision_id} not submitted.")
+        elif result.get("ok"):
             set_decision_status(decision_id, "executed")
         else:
             set_decision_status(decision_id, "failed")

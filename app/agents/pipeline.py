@@ -499,6 +499,50 @@ def run_weekly_pipeline(manager_id: int, dry_run: bool = False, force: bool = Fa
             "gw_picks": gw_picks, "gw_target": gw,
         }
 
+    # A null transfer limit means a wildcard or free hit is switched on for gw:
+    # the manager rebuilt the squad by hand. There is no transfer to propose,
+    # and the public picks above are LAST gameweek's squad — so pick the XI and
+    # captain for the squad /my-team/ holds now. A no-op transfer decision is
+    # recorded as executed, so the per-gameweek idempotency guard holds and
+    # the picks aren't parked behind a transfer that will never resolve.
+    if my_team_transfers is not None and "limit" in my_team_transfers and my_team_transfers["limit"] is None:
+        with observability.step(run_id, "pipeline.chip_squad", gameweek=gw, manager_id=manager_id) as ctx:
+            from ..fpl_auth import fetch_my_team, get_access_token
+            my_team = fetch_my_team(get_access_token(), manager_id)
+            raw_picks = [
+                {
+                    "element": p["element"], "position": p["position"], "multiplier": p.get("multiplier", 1),
+                    "is_captain": p.get("is_captain", False), "is_vice_captain": p.get("is_vice_captain", False),
+                }
+                for p in my_team.get("picks", [])
+            ]
+            squad = build_squad_picks(
+                raw_picks, player_lookup, team_lookup, gw, fixtures, bootstrap,
+                fetch_squad_recent_forms([p["element"] for p in raw_picks]), strength_lookup,
+            )
+            player_predictions = _predicted_points_for(
+                [p.player for p in squad], team_form_lookup, strength_lookup, team_id_by_name, gw
+            )
+            ctx["detail"] = {
+                "reason": "wildcard_or_freehit_active",
+                "squad": [pk.player.web_name for pk in squad],
+                "predictions": {pk.player.web_name: player_predictions.get(pk.player.id) for pk in squad},
+            }
+        noop = {
+            "proceed": False, "transfers": [], "confidence": "High",
+            "summary": "Wildcard / free hit active — squad set manually, no transfer proposed.",
+        }
+        transfer_id = db.create_agent_decision(manager_id, gw, "transfer", noop, "High")
+        db.set_decision_status(transfer_id, "executed")
+        captain_decision, lineup_decision = run_lineup_selection(
+            manager_id, gw, squad, player_predictions, run_id, assumes_transfer_id=transfer_id,
+        )
+        return {
+            "gameweek": gw, "run_id": run_id, "chip": "wildcard_or_freehit",
+            "transfer": {"decision_id": transfer_id, **noop},
+            "captain": captain_decision, "lineup": lineup_decision,
+        }
+
     with observability.step(run_id, "pipeline.ml_predict", gameweek=gw, manager_id=manager_id) as ctx:
         player_predictions = _predicted_points_for(
             [p.player for p in squad], team_form_lookup, strength_lookup, team_id_by_name, gw

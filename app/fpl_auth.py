@@ -108,6 +108,27 @@ def fetch_my_team(access_token: str, manager_id: int) -> dict:
     return resp.json()
 
 
+def active_chip(my_team: dict) -> str | None:
+    """
+    The chip the manager has switched on for the upcoming gameweek, from a
+    /my-team/ response, or None.
+
+    A chip played by hand after the bot decided makes its proposals stale: a
+    wildcard or free hit replaces the squad the transfer and XI were chosen
+    for, and set_lineup/submit_transfers both send `"chip": None`, which can
+    switch off a bench boost or triple captain set in the app. Both
+    `status_for_entry == "active"` and an unlimited (`null`) transfer limit are
+    checked — the latter is how /my-team/ shows a wildcard or free hit.
+    """
+    for chip in my_team.get("chips") or []:
+        if chip.get("status_for_entry") == "active":
+            return chip.get("name") or "unknown"
+    transfers = my_team.get("transfers")
+    if isinstance(transfers, dict) and "limit" in transfers and transfers["limit"] is None:
+        return "wildcard_or_freehit"
+    return None
+
+
 def _post_with_retry(url: str, payload: dict, access_token: str, retries: int, backoff_seconds: int) -> dict:
     """
     A 4xx means FPL rejected the payload itself (bad data, invalid move) —
